@@ -32,3 +32,25 @@ Thumbs.db
 *.zip
 *.bak
 *.tmp
+
+# CPA registerer local runtime
+register-cpa/config.json
+register-cpa/.venv/
+register-cpa/**/__pycache__/
+register-cpa/accounts_*.txt
+register-cpa/sso_pending.txt
+register-cpa/cpa_auth/
+register-cpa/*.log
+register-cpa/logs/
+
+# local CF temp email deploy artifacts / secrets
+tools/cf-temp-email-secrets/
+tools/cloudflare_temp_email/
+tools/cloudflare_temp_email/worker/wrangler.toml
+tools/cloudflare_temp_email/worker/node_modules/
+tools/cloudflare_temp_email/**/node_modules/
+.local_sub2_login.json
+register-cpa/.venv/
+register-cpa/cpa_auth/
+register-cpa/accounts_*.txt
+register-cpa/config.json

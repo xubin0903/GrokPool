@@ -70,6 +70,7 @@ CC Switch / Claude Code / 自建 Bot 都按这套接，不用理解 xAI 内部 c
 - [代理：必须开穿透 / 虚拟网卡](#代理必须开穿透--虚拟网卡)
 - [注册机面板](#注册机面板)
 - [OAuth 硬规则（必读）](#oauth-硬规则必读)
+- [Cloudflare 自建临时邮箱（推荐）](#cloudflare-自建临时邮箱推荐)
 - [死号探测](#死号探测)
 - [CC Switch / Claude Code（OpenAI 格式）](#cc-switch--claude-codeopenai-格式)
 - [代码与 Docker 一致性](#代码与-docker-一致性)
@@ -556,6 +557,55 @@ curl https://api.ip.sb/ip
 
 ---
 
+## Cloudflare 自建临时邮箱（推荐）
+
+公共临时域（如部分 duckmail / tempmail）容易被 xAI 整域拒绝。  
+**推荐用 Cloudflare + 自己的域名** 搭临时邮（无需 VPS）。
+
+### 完整教程
+
+👉 **[docs/CF_TEMP_EMAIL.md](docs/CF_TEMP_EMAIL.md)**
+
+内容包括：
+
+- 免费域名怎么接（示例面板：https://my.dnshe.com/clientarea.php ）
+- Cloudflare 添加站点 / 改 NS
+- Email Routing（MX）怎么开
+- `cloudflare_temp_email` Worker 部署（可复制提示词让 AI 代部署）
+- Catch-all 指到 Worker
+- `register-win` / `register-cpa` 的 `config.json` 字段
+- 验收清单与排错
+
+### 最短路径
+
+```text
+1. 域名 NS → Cloudflare（Active）
+2. Email Routing 启用（出现 MX）
+3. 部署 https://github.com/dreamhunter2333/cloudflare_temp_email
+4. Catch-all → 你的 Worker
+5. 注册机填 cloudflare/cfworker API + admin + 域名
+```
+
+### 注册机关键字段（示例）
+
+```json
+{
+  "email_provider": "cfworker",
+  "cfworker_api_url": "https://mail-api.你的域名.com",
+  "cfworker_admin_token": "你的ADMIN密码",
+  "cfworker_domain": "你的域名.com",
+  "cloudflare_api_base": "https://mail-api.你的域名.com",
+  "cloudflare_api_key": "你的ADMIN密码",
+  "cloudflare_auth_mode": "x-admin-auth",
+  "cloudflare_path_accounts": "/admin/new_address",
+  "defaultDomains": "你的域名.com"
+}
+```
+
+不会部署？把 [docs/CF_TEMP_EMAIL.md](docs/CF_TEMP_EMAIL.md) 里的「让 AI 帮你部署」提示词整段丢给 AI，把域名换成你的即可。
+
+---
+
 ## OAuth 硬规则（必读）
 
 详细：[`docs/OAUTH.md`](docs/OAUTH.md)
@@ -697,11 +747,18 @@ GrokPool/
 │   ├── build-sub2api.ps1     # 构建=运行
 │   └── check-parity.ps1      # 一致性检查
 ├── docs/
+│   ├── CF_TEMP_EMAIL.md      # Cloudflare 自建临时邮箱（含免费域名）
 │   ├── OAUTH.md
 │   ├── CCSWITCH.md
 │   ├── SCHEDULER.md
 │   ├── PATCHES.md
+│   ├── WORKFLOW.md
 │   └── NOTES_FOR_AI.md
+├── scripts/
+│   ├── build-sub2api.ps1
+│   ├── check-parity.ps1
+│   ├── promote-to-main.ps1
+│   └── deploy-cf-temp-email.ps1   # CF 临时邮辅助部署（需 wrangler login）
 ├── worker/
 │   ├── start_worker.bat
 │   └── README.md

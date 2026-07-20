@@ -22,8 +22,9 @@ See `docs/OAUTH.md`.
 
 ## Mail
 - Gmail `+` / dots / googlemail collapse to one xAI identity — useless for bulk.
-- Prefer self-host CF Worker mail / DuckMail key / real distinct mailboxes.
-- Public temp domains are often abused and blocked.
+- Prefer self-host **Cloudflare temp email** (domain + Email Routing + Worker). See `docs/CF_TEMP_EMAIL.md`.
+- Free domains (e.g. dnshe client area) work if NS can point to Cloudflare.
+- Public temp domains are often abused and blocked by xAI.
 
 ## Import path
 Register success → panel CPA worker (auth-code) → `AUTO_SUB2_PUSH` → Sub2 `type=oauth` account.
