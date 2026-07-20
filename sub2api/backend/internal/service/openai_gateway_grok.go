@@ -1177,20 +1177,195 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 		return
 	}
 	now := time.Now()
-	s.updateGrokUsageSnapshot(ctx, account, parseGrokQuotaSnapshot(headers, statusCode, now))
+	snapshot := parseGrokQuotaSnapshot(headers, statusCode, now)
+	// Free OAuth body often carries the authoritative window even when headers lag:
+	// {"code":"subscription:free-usage-exhausted","error":"... tokens (actual/limit): 1124730/1000000 ..."}
+	if statusCode == http.StatusTooManyRequests {
+		if bodySnap := parseGrokFreeUsageExhaustedBody(responseBody, now); bodySnap != nil {
+			snapshot = mergeGrokQuotaSnapshots(snapshot, bodySnap)
+		}
+	}
+	s.updateGrokUsageSnapshot(ctx, account, snapshot)
 	switch statusCode {
 	case http.StatusUnauthorized:
 		s.tempUnscheduleGrok(ctx, account, 10*time.Minute, "grok credentials unauthorized")
 	case http.StatusForbidden:
 		s.tempUnscheduleGrok(ctx, account, 30*time.Minute, "grok access or entitlement denied")
 	case http.StatusTooManyRequests:
+		// Free daily window exhausted: pin remaining=0 and hold until rolling reset
+		// (prefer ~24h when body says free-usage-exhausted without a shorter header reset).
+		if isGrokFreeUsageExhaustedBody(responseBody) {
+			resetAt, limited := grokRateLimitResetAtForAccount(account, snapshot, now)
+			if !limited || !resetAt.After(now.Add(30*time.Minute)) {
+				resetAt = now.Add(24 * time.Hour)
+			}
+			// Force token window to zero so UI/scheduler both see exhausted.
+			if snapshot == nil {
+				snapshot = &xai.QuotaSnapshot{StatusCode: statusCode, UpdatedAt: now.UTC().Format(time.RFC3339)}
+			}
+			zero := int64(0)
+			limit := int64(1_000_000)
+			if snapshot.Tokens != nil && snapshot.Tokens.Limit != nil && *snapshot.Tokens.Limit > 0 {
+				limit = *snapshot.Tokens.Limit
+			}
+			resetUnix := resetAt.Unix()
+			snapshot.Tokens = &xai.QuotaWindow{
+				Limit:     &limit,
+				Remaining: &zero,
+				ResetUnix: &resetUnix,
+				ResetAt:   resetAt.UTC().Format(time.RFC3339),
+			}
+			snapshot.StatusCode = statusCode
+			snapshot.ObservationSource = "free_usage_exhausted_body"
+			snapshot.HeadersObserved = true
+			s.updateGrokUsageSnapshot(ctx, account, snapshot)
+			s.rateLimitGrok(ctx, account, resetAt)
+		}
 		// updateGrokUsageSnapshot installs both runtime and durable rate-limit state.
 	default:
 		if statusCode >= 500 {
 			s.tempUnscheduleGrok(ctx, account, 2*time.Minute, "grok upstream temporary error")
 		}
 	}
-	_ = responseBody
+}
+
+func isGrokFreeUsageExhaustedBody(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	low := strings.ToLower(string(body))
+	return strings.Contains(low, "free-usage-exhausted") ||
+		strings.Contains(low, "used all the included free usage") ||
+		(strings.Contains(low, "subscription:") && strings.Contains(low, "free") && strings.Contains(low, "exhausted"))
+}
+
+// parseGrokFreeUsageExhaustedBody extracts actual/limit from free-usage-exhausted JSON/text.
+// Example: tokens (actual/limit): 1124730/1000000
+func parseGrokFreeUsageExhaustedBody(body []byte, now time.Time) *xai.QuotaSnapshot {
+	if !isGrokFreeUsageExhaustedBody(body) {
+		return nil
+	}
+	text := string(body)
+	// Prefer structured fields when present.
+	code := strings.TrimSpace(gjson.GetBytes(body, "code").String())
+	errMsg := strings.TrimSpace(gjson.GetBytes(body, "error").String())
+	if errMsg == "" {
+		errMsg = text
+	}
+	actual, limit, ok := parseGrokActualLimitTokens(errMsg)
+	if !ok {
+		actual, limit, ok = parseGrokActualLimitTokens(text)
+	}
+	if !ok {
+		// Still mark exhausted with default free window.
+		actual, limit = 1_000_000, 1_000_000
+	}
+	if limit <= 0 {
+		limit = 1_000_000
+	}
+	// Cap remaining at 0 when actual >= limit (upstream already over).
+	remaining := limit - actual
+	if remaining < 0 || actual >= limit || code == "subscription:free-usage-exhausted" {
+		remaining = 0
+	}
+	// Rolling 24h window default when headers omit reset.
+	resetAt := now.Add(24 * time.Hour)
+	resetUnix := resetAt.Unix()
+	snap := &xai.QuotaSnapshot{
+		Tokens: &xai.QuotaWindow{
+			Limit:     &limit,
+			Remaining: &remaining,
+			ResetUnix: &resetUnix,
+			ResetAt:   resetAt.UTC().Format(time.RFC3339),
+		},
+		StatusCode:        http.StatusTooManyRequests,
+		HeadersObserved:   true,
+		ObservationSource: "free_usage_exhausted_body",
+		UpdatedAt:         now.UTC().Format(time.RFC3339),
+	}
+	return snap
+}
+
+func parseGrokActualLimitTokens(text string) (actual, limit int64, ok bool) {
+	// tokens (actual/limit): 1124730/1000000
+	// also tolerate "actual/limit): 1/1" spacing variants
+	low := strings.ToLower(text)
+	idx := strings.Index(low, "actual/limit")
+	if idx < 0 {
+		idx = strings.Index(low, "actual / limit")
+	}
+	if idx < 0 {
+		return 0, 0, false
+	}
+	rest := text[idx:]
+	// find first digit pair a/b
+	for i := 0; i < len(rest); i++ {
+		if rest[i] < '0' || rest[i] > '9' {
+			continue
+		}
+		j := i
+		for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
+			j++
+		}
+		if j >= len(rest) || rest[j] != '/' {
+			i = j
+			continue
+		}
+		aStr := rest[i:j]
+		k := j + 1
+		for k < len(rest) && rest[k] >= '0' && rest[k] <= '9' {
+			k++
+		}
+		if k == j+1 {
+			i = j
+			continue
+		}
+		bStr := rest[j+1 : k]
+		var a, b int64
+		if _, err := fmt.Sscan(aStr, &a); err != nil {
+			return 0, 0, false
+		}
+		if _, err := fmt.Sscan(bStr, &b); err != nil {
+			return 0, 0, false
+		}
+		if b <= 0 {
+			return 0, 0, false
+		}
+		return a, b, true
+	}
+	return 0, 0, false
+}
+
+func mergeGrokQuotaSnapshots(base, overlay *xai.QuotaSnapshot) *xai.QuotaSnapshot {
+	if overlay == nil {
+		return base
+	}
+	if base == nil {
+		return overlay
+	}
+	out := *base
+	if overlay.Tokens != nil {
+		out.Tokens = overlay.Tokens
+	}
+	if overlay.Requests != nil {
+		out.Requests = overlay.Requests
+	}
+	if overlay.RetryAfterSeconds != nil {
+		out.RetryAfterSeconds = overlay.RetryAfterSeconds
+	}
+	if overlay.StatusCode != 0 {
+		out.StatusCode = overlay.StatusCode
+	}
+	if overlay.ObservationSource != "" {
+		out.ObservationSource = overlay.ObservationSource
+	}
+	if overlay.HeadersObserved {
+		out.HeadersObserved = true
+	}
+	if overlay.UpdatedAt != "" {
+		out.UpdatedAt = overlay.UpdatedAt
+	}
+	return &out
 }
 
 func (s *OpenAIGatewayService) tempUnscheduleGrok(ctx context.Context, account *Account, cooldown time.Duration, reason string) {
