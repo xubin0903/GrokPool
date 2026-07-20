@@ -1,0 +1,24 @@
+# Web panel
+flask>=3.0.0
+
+# Register + CPA convert
+certifi>=2024.0.0
+cffi>=1.16.0
+charset-normalizer>=3.3.0
+cssselect>=1.2.0
+curl_cffi>=0.7.0
+DataRecorder>=3.6.0
+DownloadKit>=2.0.0
+DrissionPage>=4.1.0
+# Camoufox headless anti-detect Firefox (optional engine; binary auto-fetched on first use)
+camoufox[geoip]>=0.4.0
+filelock>=3.13.0
+idna>=3.6
+lxml>=5.0.0
+psutil>=5.9.0
+pycparser>=2.21
+requests>=2.31.0
+requests-file>=2.0.0
+tldextract>=5.1.0
+urllib3>=2.1.0
+websocket-client>=1.7.0
