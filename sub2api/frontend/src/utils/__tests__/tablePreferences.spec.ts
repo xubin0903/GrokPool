@@ -3,8 +3,10 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   DEFAULT_TABLE_PAGE_SIZE,
   DEFAULT_TABLE_PAGE_SIZE_OPTIONS,
+  TABLE_PAGE_SIZE_ALL,
   getConfiguredTableDefaultPageSize,
   getConfiguredTablePageSizeOptions,
+  isTablePageSizeAll,
   normalizeTablePageSize
 } from '@/utils/tablePreferences'
 
@@ -16,16 +18,17 @@ describe('tablePreferences', () => {
   it('returns built-in defaults when app config is missing', () => {
     expect(getConfiguredTableDefaultPageSize()).toBe(DEFAULT_TABLE_PAGE_SIZE)
     expect(getConfiguredTablePageSizeOptions()).toEqual(DEFAULT_TABLE_PAGE_SIZE_OPTIONS)
+    expect(DEFAULT_TABLE_PAGE_SIZE_OPTIONS).toContain(TABLE_PAGE_SIZE_ALL)
   })
 
-  it('uses configured defaults when app config is valid', () => {
+  it('uses configured defaults and always exposes all option', () => {
     window.__APP_CONFIG__ = {
       table_default_page_size: 50,
       table_page_size_options: [20, 50, 100]
     } as any
 
     expect(getConfiguredTableDefaultPageSize()).toBe(50)
-    expect(getConfiguredTablePageSizeOptions()).toEqual([20, 50, 100])
+    expect(getConfiguredTablePageSizeOptions()).toEqual([20, 50, 100, TABLE_PAGE_SIZE_ALL])
   })
 
   it('allows default page size outside selectable options', () => {
@@ -35,8 +38,9 @@ describe('tablePreferences', () => {
     } as any
 
     expect(getConfiguredTableDefaultPageSize()).toBe(1000)
-    expect(getConfiguredTablePageSizeOptions()).toEqual([20, 50, 100])
-    expect(normalizeTablePageSize(1000)).toBe(100)
+    expect(getConfiguredTablePageSizeOptions()).toEqual([20, 50, 100, TABLE_PAGE_SIZE_ALL])
+    // exact all value stays all
+    expect(normalizeTablePageSize(1000)).toBe(TABLE_PAGE_SIZE_ALL)
     expect(normalizeTablePageSize(35)).toBe(50)
   })
 
@@ -47,7 +51,7 @@ describe('tablePreferences', () => {
     } as any
 
     expect(getConfiguredTableDefaultPageSize()).toBe(35)
-    expect(getConfiguredTablePageSizeOptions()).toEqual([10, 50])
+    expect(getConfiguredTablePageSizeOptions()).toEqual([10, 50, TABLE_PAGE_SIZE_ALL])
     expect(normalizeTablePageSize(undefined)).toBe(50)
   })
 
@@ -64,11 +68,12 @@ describe('tablePreferences', () => {
     expect(normalizeTablePageSize(undefined)).toBe(20)
   })
 
-  it('keeps built-in selectable defaults at 10, 20, 50, 100', () => {
+  it('keeps built-in selectable defaults including all', () => {
     window.__APP_CONFIG__ = {
       table_default_page_size: 1000
     } as any
 
-    expect(getConfiguredTablePageSizeOptions()).toEqual([10, 20, 50, 100])
+    expect(getConfiguredTablePageSizeOptions()).toEqual([10, 20, 50, 100, 200, 500, TABLE_PAGE_SIZE_ALL])
+    expect(isTablePageSizeAll(TABLE_PAGE_SIZE_ALL)).toBe(true)
   })
 })

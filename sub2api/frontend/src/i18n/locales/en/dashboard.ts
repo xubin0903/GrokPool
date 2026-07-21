@@ -800,6 +800,7 @@ export default {
     previous: 'Previous',
     next: 'Next',
     perPage: 'Per page',
+    all: 'All ({max})',
     goToPage: 'Go to page {page}',
     jumpTo: 'Jump to',
     jumpPlaceholder: 'Page',
