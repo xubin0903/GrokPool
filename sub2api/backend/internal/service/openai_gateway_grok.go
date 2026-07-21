@@ -68,29 +68,6 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	if err != nil {
 		return nil, err
 	}
-	// OpenAI has /responses/compact; Grok does not. Reuse the same idea locally:
-	// drop oldest input items until estimated prompt fits ~500k (minus safety margin).
-	if compacted, dropped, cerr := compactGrokResponsesInputIfNeeded(patchedBody, upstreamModel); cerr != nil {
-		slog.Warn("grok_prompt_compact_failed", "account_id", account.ID, "error", cerr.Error())
-	} else if dropped > 0 {
-		patchedBody = compacted
-		slog.Info("grok_prompt_auto_compacted",
-			"account_id", account.ID,
-			"model", upstreamModel,
-			"dropped_input_items", dropped,
-			"body_bytes", len(patchedBody),
-		)
-	}
-	patchedBody, err = applyGrokResponsesCacheIdentity(patchedBody, body, cacheIdentity, account.IsGrokOAuth())
-	if err != nil {
-		return nil, fmt.Errorf("apply grok prompt cache identity: %w", err)
-	}
-	// Free OAuth + client function tools: reuse Messages mixed-tools cache route
-	// (append web_search/x_search so xAI does not force non-cacheable build-free).
-	patchedBody, err = applyGrokFreeMessagesFunctionToolCacheRoute(patchedBody, body, account, cacheIdentity)
-	if err != nil {
-		return nil, fmt.Errorf("apply grok Free function-tool cache route: %w", err)
-	}
 
 	token, _, err := s.getRequestCredential(ctx, c, account)
 	if err != nil {
@@ -103,6 +80,36 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	proxyURL := ""
 	if account.ProxyID != nil && account.Proxy != nil {
 		proxyURL = account.Proxy.URL()
+	}
+
+	// OpenAI has /responses/compact; Grok does not. Prefer summary compact
+	// (summarize older turns via same account), fall back to hard-drop.
+	if compacted, compactMeta, cerr := s.autoCompactGrokPrompt(upstreamCtx, c, account, patchedBody, upstreamModel, token, proxyURL); cerr != nil {
+		slog.Warn("grok_prompt_compact_failed", "account_id", account.ID, "error", cerr.Error())
+	} else if compactMeta.Mode != "noop" {
+		patchedBody = compacted
+		slog.Info("grok_prompt_auto_compacted",
+			"account_id", account.ID,
+			"model", upstreamModel,
+			"mode", compactMeta.Mode,
+			"dropped_input_items", compactMeta.DroppedItems,
+			"summarized", compactMeta.Summarized,
+			"summary_chars", compactMeta.SummaryChars,
+			"before_est_tokens", compactMeta.BeforeEstTokens,
+			"after_est_tokens", compactMeta.AfterEstTokens,
+			"body_bytes", len(patchedBody),
+		)
+	}
+
+	patchedBody, err = applyGrokResponsesCacheIdentity(patchedBody, body, cacheIdentity, account.IsGrokOAuth())
+	if err != nil {
+		return nil, fmt.Errorf("apply grok prompt cache identity: %w", err)
+	}
+	// Free OAuth + client function tools: reuse Messages mixed-tools cache route
+	// (append web_search/x_search so xAI does not force non-cacheable build-free).
+	patchedBody, err = applyGrokFreeMessagesFunctionToolCacheRoute(patchedBody, body, account, cacheIdentity)
+	if err != nil {
+		return nil, fmt.Errorf("apply grok Free function-tool cache route: %w", err)
 	}
 
 	upstreamStart := time.Now()
