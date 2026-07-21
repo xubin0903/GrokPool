@@ -35,12 +35,6 @@ const (
 	grokRateLimitSustainedCooldown         = 30 * time.Minute
 	grokRateLimitMaxAdaptiveCooldown       = time.Hour
 	grokRateLimitBackoffQuietPeriod        = time.Hour
-
-	// Local auto-compact for Grok (no /responses/compact upstream).
-	// xAI grok-4.5 max prompt is 500k; keep margin for tools/overhead.
-	grokDefaultMaxPromptTokens  = 500_000
-	grokPromptTokenSafetyMargin = 8_000
-	grokMinPromptInputItemsKeep = 2
 )
 
 func (s *OpenAIGatewayService) forwardGrokResponses(
@@ -82,25 +76,6 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		proxyURL = account.Proxy.URL()
 	}
 
-	// OpenAI has /responses/compact; Grok does not. Prefer summary compact
-	// (summarize older turns via same account), fall back to hard-drop.
-	if compacted, compactMeta, cerr := s.autoCompactGrokPrompt(upstreamCtx, c, account, patchedBody, upstreamModel, token, proxyURL); cerr != nil {
-		slog.Warn("grok_prompt_compact_failed", "account_id", account.ID, "error", cerr.Error())
-	} else if compactMeta.Mode != "noop" {
-		patchedBody = compacted
-		slog.Info("grok_prompt_auto_compacted",
-			"account_id", account.ID,
-			"model", upstreamModel,
-			"mode", compactMeta.Mode,
-			"dropped_input_items", compactMeta.DroppedItems,
-			"summarized", compactMeta.Summarized,
-			"summary_chars", compactMeta.SummaryChars,
-			"before_est_tokens", compactMeta.BeforeEstTokens,
-			"after_est_tokens", compactMeta.AfterEstTokens,
-			"body_bytes", len(patchedBody),
-		)
-	}
-
 	patchedBody, err = applyGrokResponsesCacheIdentity(patchedBody, body, cacheIdentity, account.IsGrokOAuth())
 	if err != nil {
 		return nil, fmt.Errorf("apply grok prompt cache identity: %w", err)
@@ -114,7 +89,13 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 
 	upstreamStart := time.Now()
 	var resp *http.Response
-	for attempt := 0; ; attempt++ {
+	// attempt flags (each recovery path runs at most once):
+	//   0 = first try
+	//   bit0 = did invalid-encrypted-content trim
+	//   bit1 = did oversize reactive compact
+	didEncryptedTrim := false
+	didOversizeCompact := false
+	for {
 		upstreamReq, buildErr := buildGrokResponsesRequest(upstreamCtx, c, account, patchedBody, token, cacheIdentity, s.cfg)
 		if buildErr != nil {
 			return nil, buildErr
@@ -126,32 +107,88 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
 		}
 
-		// xAI can reject encrypted reasoning copied from a response produced under
-		// another account or cache identity. Retry once with the same routing and
-		// credential after removing only the rejected encrypted reasoning payload.
-		if attempt > 0 || resp.StatusCode != http.StatusBadRequest {
+		if resp.StatusCode != http.StatusBadRequest {
 			break
 		}
 		respBody := s.readUpstreamErrorBody(resp)
 		if resp.Body != nil {
 			_ = resp.Body.Close()
 		}
-		if !isGrokInvalidEncryptedContentResponse(resp.StatusCode, respBody) {
-			resp.Body = io.NopCloser(bytes.NewReader(respBody))
-			break
+
+		// 1) encrypted_content trim (existing path)
+		if !didEncryptedTrim && isGrokInvalidEncryptedContentResponse(http.StatusBadRequest, respBody) {
+			retryBody, changed, trimErr := trimGrokInvalidEncryptedContentRetryBody(patchedBody)
+			if trimErr != nil {
+				return nil, fmt.Errorf("prepare Grok invalid encrypted_content retry: %w", trimErr)
+			}
+			if changed {
+				patchedBody = retryBody
+				didEncryptedTrim = true
+				slog.Info("grok_invalid_encrypted_content_retry", "account_id", account.ID, "cache_identity_present", cacheIdentity != "")
+				continue
+			}
 		}
 
-		retryBody, changed, trimErr := trimGrokInvalidEncryptedContentRetryBody(patchedBody)
-		if trimErr != nil {
-			return nil, fmt.Errorf("prepare Grok invalid encrypted_content retry: %w", trimErr)
-		}
-		if !changed {
-			resp.Body = io.NopCloser(bytes.NewReader(respBody))
-			break
+		// 2) reactive oversize compact: only after upstream confirms prompt too large
+		if !didOversizeCompact && isGrokPromptTooLargeResponse(http.StatusBadRequest, respBody) {
+			compacted, compactMeta, cerr := s.compactGrokPromptAfterOversize(upstreamCtx, c, account, patchedBody, upstreamModel)
+			if cerr != nil {
+				slog.Warn("grok_prompt_oversize_compact_failed",
+					"account_id", account.ID,
+					"model", upstreamModel,
+					"before_bytes", compactMeta.BeforeBytes,
+					"error", cerr.Error(),
+					"upstream_msg", sanitizeUpstreamErrorMessage(extractUpstreamErrorMessage(respBody)),
+				)
+				return nil, writeGrokPromptCompactFailed502(c, cerr.Error())
+			}
+			if compactMeta.Mode == "noop" || len(compacted) == 0 || bytes.Equal(compacted, patchedBody) {
+				slog.Warn("grok_prompt_oversize_compact_noop",
+					"account_id", account.ID,
+					"model", upstreamModel,
+					"before_bytes", len(patchedBody),
+				)
+				return nil, writeGrokPromptCompactFailed502(c, "no reduction possible")
+			}
+			// Re-apply cache identity / free function-tool route on the compacted body.
+			// Use original client body only for identity seeds that predate patching.
+			nextBody := compacted
+			if next, aerr := applyGrokResponsesCacheIdentity(nextBody, body, cacheIdentity, account.IsGrokOAuth()); aerr == nil {
+				nextBody = next
+			}
+			if next, aerr := applyGrokFreeMessagesFunctionToolCacheRoute(nextBody, body, account, cacheIdentity); aerr == nil {
+				nextBody = next
+			}
+			patchedBody = nextBody
+			didOversizeCompact = true
+			slog.Info("grok_prompt_oversize_compacted",
+				"account_id", account.ID,
+				"model", upstreamModel,
+				"mode", compactMeta.Mode,
+				"summary_account_id", compactMeta.SummaryAccount,
+				"dropped_items", compactMeta.DroppedItems,
+				"summary_chars", compactMeta.SummaryChars,
+				"before_bytes", compactMeta.BeforeBytes,
+				"after_bytes", compactMeta.AfterBytes,
+				"before_est_tokens", compactMeta.BeforeEstTokens,
+				"after_est_tokens", compactMeta.AfterEstTokens,
+			)
+			continue
 		}
 
-		patchedBody = retryBody
-		slog.Info("grok_invalid_encrypted_content_retry", "account_id", account.ID, "cache_identity_present", cacheIdentity != "")
+		// Post-compact still 400 oversize → hard 502 (do not loop).
+		if didOversizeCompact && isGrokPromptTooLargeResponse(http.StatusBadRequest, respBody) {
+			slog.Warn("grok_prompt_oversize_retry_still_too_large",
+				"account_id", account.ID,
+				"model", upstreamModel,
+				"body_bytes", len(patchedBody),
+			)
+			return nil, writeGrokPromptCompactFailed502(c, "still over limit after compact")
+		}
+
+		// Other 400s: restore body and fall through to normal error handling.
+		resp.Body = io.NopCloser(bytes.NewReader(respBody))
+		break
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -904,131 +941,6 @@ func applyGrokCLIHeaders(headers http.Header) {
 	headers.Set("X-Grok-Client-Version", grokCLIVersion)
 }
 
-// compactGrokResponsesInputIfNeeded drops oldest Responses "input" (or chat
-// "messages") items when estimated prompt exceeds Grok's ~500k budget.
-// Same spirit as OpenAI remote compact, but local-only (Grok has no /compact).
-// Uses fast byte-length estimates only — never tiktoken on multi-MB bodies.
-func compactGrokResponsesInputIfNeeded(body []byte, model string) ([]byte, int, error) {
-	if len(body) == 0 {
-		return body, 0, nil
-	}
-	budget := grokPromptTokenBudget(model)
-	if estimateGrokResponsesBodyTokens(body, model) <= budget {
-		return body, 0, nil
-	}
-	if input := gjson.GetBytes(body, "input"); input.Exists() && input.IsArray() {
-		return compactGrokJSONArrayField(body, "input", model, budget)
-	}
-	if messages := gjson.GetBytes(body, "messages"); messages.Exists() && messages.IsArray() {
-		return compactGrokJSONArrayField(body, "messages", model, budget)
-	}
-	return body, 0, nil
-}
-
-func compactGrokJSONArrayField(body []byte, field string, model string, budget int) ([]byte, int, error) {
-	items := gjson.GetBytes(body, field).Array()
-	n := len(items)
-	if n <= grokMinPromptInputItemsKeep {
-		return body, 0, nil
-	}
-
-	// Preserve leading system/developer messages for chat-style arrays.
-	keepPrefix := 0
-	if field == "messages" {
-		for keepPrefix < n {
-			role := strings.ToLower(strings.TrimSpace(items[keepPrefix].Get("role").String()))
-			if role != "system" && role != "developer" {
-				break
-			}
-			keepPrefix++
-		}
-	}
-
-	// Overhead outside the array field (model/tools/instructions/etc).
-	arrayRawLen := len(gjson.GetBytes(body, field).Raw)
-	overheadBytes := len(body) - arrayRawLen
-	if overheadBytes < 0 {
-		overheadBytes = 0
-	}
-
-	// Per-item raw JSON sizes (cheap; no tokenization).
-	sizes := make([]int, n)
-	for i, it := range items {
-		sizes[i] = len(it.Raw)
-	}
-
-	// Drop from the oldest droppable item until estimated tokens fit.
-	// Estimate: (overhead + sum(kept raw)) / 2 — conservative for CJK/tool payloads.
-	start := keepPrefix // first droppable index
-	minStart := n - grokMinPromptInputItemsKeep
-	if minStart < keepPrefix {
-		minStart = keepPrefix
-	}
-	for start < minStart {
-		sum := overheadBytes
-		for i := 0; i < keepPrefix; i++ {
-			sum += sizes[i]
-		}
-		for i := start; i < n; i++ {
-			sum += sizes[i]
-		}
-		keptCount := keepPrefix + (n - start)
-		if keptCount > 1 {
-			sum += keptCount - 1
-		}
-		if sum/2 <= budget {
-			break
-		}
-		remainingDroppable := minStart - start
-		step := remainingDroppable / 2
-		if step < 1 {
-			step = 1
-		}
-		start += step
-		if start > minStart {
-			start = minStart
-		}
-	}
-
-	dropped := start - keepPrefix
-	if dropped <= 0 {
-		return body, 0, nil
-	}
-
-	kept := make([]gjson.Result, 0, keepPrefix+(n-start))
-	kept = append(kept, items[:keepPrefix]...)
-	kept = append(kept, items[start:]...)
-	rawParts := make([][]byte, 0, len(kept))
-	for _, it := range kept {
-		rawParts = append(rawParts, []byte(it.Raw))
-	}
-	joined := append(append([]byte{'['}, bytes.Join(rawParts, []byte{','})...), ']')
-	next, err := sjson.SetRawBytes(body, field, joined)
-	if err != nil {
-		return body, 0, err
-	}
-	return next, dropped, nil
-}
-
-func grokPromptTokenBudget(model string) int {
-	_ = model
-	budget := grokDefaultMaxPromptTokens - grokPromptTokenSafetyMargin
-	if budget < 50_000 {
-		return 50_000
-	}
-	return budget
-}
-
-// estimateGrokResponsesBodyTokens is a FAST overestimate (no tiktoken).
-// bytes/2 tends to compact slightly early rather than risk upstream 400.
-func estimateGrokResponsesBodyTokens(body []byte, model string) int {
-	_ = model
-	if len(body) == 0 {
-		return 0
-	}
-	return len(body) / 2
-}
-
 func (s *OpenAIGatewayService) updateGrokUsageSnapshot(ctx context.Context, account *Account, snapshot *xai.QuotaSnapshot) {
 	if s == nil || account == nil || account.ID <= 0 || snapshot == nil {
 		return
@@ -1387,6 +1299,8 @@ func isGrokFreeUsageExhaustedBody(body []byte) bool {
 	low := strings.ToLower(string(body))
 	return strings.Contains(low, "free-usage-exhausted") ||
 		strings.Contains(low, "used all the included free usage") ||
+		strings.Contains(low, "free usage limit") ||
+		strings.Contains(low, "free usage has been exhausted") ||
 		(strings.Contains(low, "subscription:") && strings.Contains(low, "free") && strings.Contains(low, "exhausted"))
 }
 
