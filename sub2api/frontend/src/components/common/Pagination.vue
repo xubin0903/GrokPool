@@ -41,7 +41,7 @@
           <span class="text-sm text-gray-700 dark:text-gray-300"
             >{{ t('pagination.perPage') }}:</span
           >
-          <div class="page-size-select w-20">
+          <div class="page-size-select">
             <Select
               :model-value="pageSize"
               :options="pageSizeSelectOptions"
@@ -122,7 +122,12 @@ import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/icons/Icon.vue'
 import Select from './Select.vue'
-import { getConfiguredTablePageSizeOptions, normalizeTablePageSize } from '@/utils/tablePreferences'
+import {
+  TABLE_PAGE_SIZE_ALL,
+  getConfiguredTablePageSizeOptions,
+  isTablePageSizeAll,
+  normalizeTablePageSize
+} from '@/utils/tablePreferences'
 import { setPersistedPageSize } from '@/composables/usePersistedPageSize'
 
 const { t } = useI18n()
@@ -134,6 +139,8 @@ interface Props {
   pageSizeOptions?: number[]
   showPageSizeSelector?: boolean
   showJump?: boolean
+  /** When true, always offer "All" (up to backend max) in the page-size selector. */
+  enableAllOption?: boolean
 }
 
 interface Emits {
@@ -144,34 +151,54 @@ interface Emits {
 const props = withDefaults(defineProps<Props>(), {
   pageSizeOptions: () => getConfiguredTablePageSizeOptions(),
   showPageSizeSelector: true,
-  showJump: false
+  showJump: false,
+  enableAllOption: false
 })
 
 const emit = defineEmits<Emits>()
 
-const totalPages = computed(() => Math.ceil(props.total / props.pageSize))
+const effectivePageSize = computed(() => {
+  const size = Number(props.pageSize)
+  if (!Number.isFinite(size) || size <= 0) return 20
+  // Avoid div-by-zero / Infinity pages when "all" is selected with 0 total.
+  return size
+})
+
+const totalPages = computed(() => {
+  if (props.total <= 0) return 1
+  if (isTablePageSizeAll(effectivePageSize.value) || effectivePageSize.value >= props.total) {
+    return 1
+  }
+  return Math.max(1, Math.ceil(props.total / effectivePageSize.value))
+})
 
 const fromItem = computed(() => {
   if (props.total === 0) return 0
-  return (props.page - 1) * props.pageSize + 1
+  return (props.page - 1) * effectivePageSize.value + 1
 })
 
 const toItem = computed(() => {
-  const to = props.page * props.pageSize
+  const to = props.page * effectivePageSize.value
   return to > props.total ? props.total : to
 })
 
 const pageSizeSelectOptions = computed(() => {
+  const base = props.pageSizeOptions?.length
+    ? props.pageSizeOptions
+    : getConfiguredTablePageSizeOptions()
   const options = Array.from(
     new Set([
-      ...getConfiguredTablePageSizeOptions(),
-      normalizeTablePageSize(props.pageSize)
+      ...base,
+      normalizeTablePageSize(props.pageSize),
+      ...(props.enableAllOption ? [TABLE_PAGE_SIZE_ALL] : [])
     ])
   ).sort((a, b) => a - b)
 
   return options.map((size) => ({
     value: size,
-    label: String(size)
+    label: isTablePageSizeAll(size)
+      ? t('pagination.all', { max: TABLE_PAGE_SIZE_ALL })
+      : String(size)
   }))
 })
 
@@ -241,6 +268,9 @@ const submitJump = () => {
 </script>
 
 <style scoped>
+.page-size-select {
+  @apply w-auto min-w-[5rem];
+}
 .page-size-select :deep(.select-trigger) {
   @apply px-3 py-1.5 text-sm;
 }
