@@ -35,6 +35,12 @@ const (
 	grokRateLimitSustainedCooldown         = 30 * time.Minute
 	grokRateLimitMaxAdaptiveCooldown       = time.Hour
 	grokRateLimitBackoffQuietPeriod        = time.Hour
+
+	// Local auto-compact for Grok (no /responses/compact upstream).
+	// xAI grok-4.5 max prompt is 500k; keep margin for tools/overhead.
+	grokDefaultMaxPromptTokens  = 500_000
+	grokPromptTokenSafetyMargin = 8_000
+	grokMinPromptInputItemsKeep = 2
 )
 
 func (s *OpenAIGatewayService) forwardGrokResponses(
@@ -61,6 +67,19 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	patchedBody, err := patchGrokResponsesBody(body, upstreamModel)
 	if err != nil {
 		return nil, err
+	}
+	// OpenAI has /responses/compact; Grok does not. Reuse the same idea locally:
+	// drop oldest input items until estimated prompt fits ~500k (minus safety margin).
+	if compacted, dropped, cerr := compactGrokResponsesInputIfNeeded(patchedBody, upstreamModel); cerr != nil {
+		slog.Warn("grok_prompt_compact_failed", "account_id", account.ID, "error", cerr.Error())
+	} else if dropped > 0 {
+		patchedBody = compacted
+		slog.Info("grok_prompt_auto_compacted",
+			"account_id", account.ID,
+			"model", upstreamModel,
+			"dropped_input_items", dropped,
+			"body_bytes", len(patchedBody),
+		)
 	}
 	patchedBody, err = applyGrokResponsesCacheIdentity(patchedBody, body, cacheIdentity, account.IsGrokOAuth())
 	if err != nil {
@@ -876,6 +895,131 @@ func applyGrokCLIHeaders(headers http.Header) {
 	}
 	headers.Set("User-Agent", grokUpstreamUserAgent)
 	headers.Set("X-Grok-Client-Version", grokCLIVersion)
+}
+
+// compactGrokResponsesInputIfNeeded drops oldest Responses "input" (or chat
+// "messages") items when estimated prompt exceeds Grok's ~500k budget.
+// Same spirit as OpenAI remote compact, but local-only (Grok has no /compact).
+// Uses fast byte-length estimates only — never tiktoken on multi-MB bodies.
+func compactGrokResponsesInputIfNeeded(body []byte, model string) ([]byte, int, error) {
+	if len(body) == 0 {
+		return body, 0, nil
+	}
+	budget := grokPromptTokenBudget(model)
+	if estimateGrokResponsesBodyTokens(body, model) <= budget {
+		return body, 0, nil
+	}
+	if input := gjson.GetBytes(body, "input"); input.Exists() && input.IsArray() {
+		return compactGrokJSONArrayField(body, "input", model, budget)
+	}
+	if messages := gjson.GetBytes(body, "messages"); messages.Exists() && messages.IsArray() {
+		return compactGrokJSONArrayField(body, "messages", model, budget)
+	}
+	return body, 0, nil
+}
+
+func compactGrokJSONArrayField(body []byte, field string, model string, budget int) ([]byte, int, error) {
+	items := gjson.GetBytes(body, field).Array()
+	n := len(items)
+	if n <= grokMinPromptInputItemsKeep {
+		return body, 0, nil
+	}
+
+	// Preserve leading system/developer messages for chat-style arrays.
+	keepPrefix := 0
+	if field == "messages" {
+		for keepPrefix < n {
+			role := strings.ToLower(strings.TrimSpace(items[keepPrefix].Get("role").String()))
+			if role != "system" && role != "developer" {
+				break
+			}
+			keepPrefix++
+		}
+	}
+
+	// Overhead outside the array field (model/tools/instructions/etc).
+	arrayRawLen := len(gjson.GetBytes(body, field).Raw)
+	overheadBytes := len(body) - arrayRawLen
+	if overheadBytes < 0 {
+		overheadBytes = 0
+	}
+
+	// Per-item raw JSON sizes (cheap; no tokenization).
+	sizes := make([]int, n)
+	for i, it := range items {
+		sizes[i] = len(it.Raw)
+	}
+
+	// Drop from the oldest droppable item until estimated tokens fit.
+	// Estimate: (overhead + sum(kept raw)) / 2 — conservative for CJK/tool payloads.
+	start := keepPrefix // first droppable index
+	minStart := n - grokMinPromptInputItemsKeep
+	if minStart < keepPrefix {
+		minStart = keepPrefix
+	}
+	for start < minStart {
+		sum := overheadBytes
+		for i := 0; i < keepPrefix; i++ {
+			sum += sizes[i]
+		}
+		for i := start; i < n; i++ {
+			sum += sizes[i]
+		}
+		keptCount := keepPrefix + (n - start)
+		if keptCount > 1 {
+			sum += keptCount - 1
+		}
+		if sum/2 <= budget {
+			break
+		}
+		remainingDroppable := minStart - start
+		step := remainingDroppable / 2
+		if step < 1 {
+			step = 1
+		}
+		start += step
+		if start > minStart {
+			start = minStart
+		}
+	}
+
+	dropped := start - keepPrefix
+	if dropped <= 0 {
+		return body, 0, nil
+	}
+
+	kept := make([]gjson.Result, 0, keepPrefix+(n-start))
+	kept = append(kept, items[:keepPrefix]...)
+	kept = append(kept, items[start:]...)
+	rawParts := make([][]byte, 0, len(kept))
+	for _, it := range kept {
+		rawParts = append(rawParts, []byte(it.Raw))
+	}
+	joined := append(append([]byte{'['}, bytes.Join(rawParts, []byte{','})...), ']')
+	next, err := sjson.SetRawBytes(body, field, joined)
+	if err != nil {
+		return body, 0, err
+	}
+	return next, dropped, nil
+}
+
+func grokPromptTokenBudget(model string) int {
+	_ = model
+	budget := grokDefaultMaxPromptTokens - grokPromptTokenSafetyMargin
+	if budget < 50_000 {
+		return 50_000
+	}
+	return budget
+}
+
+// estimateGrokResponsesBodyTokens is a FAST overestimate (no tiktoken).
+// bytes/2 tends to compact slightly early rather than risk upstream 400.
+func estimateGrokResponsesBodyTokens(body []byte, model string) int {
+	_ = model
+	if len(body) == 0 {
+		return 0
+	}
+	return len(body) / 2
 }
 
 func (s *OpenAIGatewayService) updateGrokUsageSnapshot(ctx context.Context, account *Account, snapshot *xai.QuotaSnapshot) {
