@@ -94,8 +94,8 @@ copy /Y "%CD%\config.example.json" "%CD%\config.json" >nul
 echo [OK] Created config.json
 
 :cfg_ok
-REM Panel port (8787 may be taken on this machine)
-if not defined PANEL_PORT set "PANEL_PORT=8877"
+REM Panel port (9000; 8877 was eaten by Windows Hyper-V excluded range)
+if not defined PANEL_PORT set "PANEL_PORT=9000"
 set "PANEL_HOST=127.0.0.1"
 echo.
 echo  Before register:

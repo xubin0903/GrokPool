@@ -108,14 +108,45 @@ func TestOpenAIHandleErrorResponse_ContextWindow502KeepsMessageWithoutFailover(t
 	require.Error(t, err)
 	var failoverErr *UpstreamFailoverError
 	require.False(t, errors.As(err, &failoverErr))
-	assert.Equal(t, http.StatusBadGateway, rec.Code)
+	// Oversize is a client-side problem: return 400 with the real upstream text.
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
 
 	var payload map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
 	errField, ok := payload["error"].(map[string]any)
 	require.True(t, ok)
-	assert.Equal(t, "upstream_error", errField["type"])
+	assert.Equal(t, "invalid_request_error", errField["type"])
 	assert.Equal(t, "Your input exceeds the context window of this model. Please adjust your input and try again.", errField["message"])
+}
+
+func TestOpenAIHandleErrorResponse_GrokMaximumPromptLengthSurfacesRealMessage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+
+	svc := &OpenAIGatewayService{}
+	upstreamMsg := "This model's maximum prompt length is 500000 but the request contains 548167 tokens."
+	respBody := []byte(`{"code":"invalid-argument","error":"` + upstreamMsg + `"}`)
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Body:       io.NopCloser(bytes.NewReader(respBody)),
+		Header:     http.Header{},
+	}
+	account := &Account{ID: 879, Platform: PlatformGrok, Type: AccountTypeOAuth}
+
+	_, err := svc.handleErrorResponse(context.Background(), resp, c, account, nil)
+	require.Error(t, err)
+	var failoverErr *UpstreamFailoverError
+	require.False(t, errors.As(err, &failoverErr))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+	errField, ok := payload["error"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "invalid_request_error", errField["type"])
+	assert.Equal(t, upstreamMsg, errField["message"])
 }
 
 func TestGeminiWriteGeminiMappedError_NoRuleKeepsDefault(t *testing.T) {

@@ -15,7 +15,7 @@ if not exist "%REG_DIR%\panel\app.py" (
 
 REM ---- defaults (override by setting env before running) ----
 if not defined PANEL_HOST set PANEL_HOST=127.0.0.1
-if not defined PANEL_PORT set PANEL_PORT=8877
+if not defined PANEL_PORT set PANEL_PORT=9000
 if not defined PANEL_AUTH set PANEL_AUTH=0
 if not defined GROK_BROWSER_ENGINE set GROK_BROWSER_ENGINE=camoufox
 if not defined GROK_PROXY set GROK_PROXY=http://127.0.0.1:7895

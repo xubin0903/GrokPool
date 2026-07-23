@@ -89,13 +89,7 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 
 	upstreamStart := time.Now()
 	var resp *http.Response
-	// attempt flags (each recovery path runs at most once):
-	//   0 = first try
-	//   bit0 = did invalid-encrypted-content trim
-	//   bit1 = did oversize reactive compact
-	didEncryptedTrim := false
-	didOversizeCompact := false
-	for {
+	for attempt := 0; ; attempt++ {
 		upstreamReq, buildErr := buildGrokResponsesRequest(upstreamCtx, c, account, patchedBody, token, cacheIdentity, s.cfg)
 		if buildErr != nil {
 			return nil, buildErr
@@ -107,88 +101,32 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
 		}
 
-		if resp.StatusCode != http.StatusBadRequest {
+		// xAI can reject encrypted reasoning copied from a response produced under
+		// another account or cache identity. Retry once with the same routing and
+		// credential after removing only the rejected encrypted reasoning payload.
+		if attempt > 0 || resp.StatusCode != http.StatusBadRequest {
 			break
 		}
 		respBody := s.readUpstreamErrorBody(resp)
 		if resp.Body != nil {
 			_ = resp.Body.Close()
 		}
-
-		// 1) encrypted_content trim (existing path)
-		if !didEncryptedTrim && isGrokInvalidEncryptedContentResponse(http.StatusBadRequest, respBody) {
-			retryBody, changed, trimErr := trimGrokInvalidEncryptedContentRetryBody(patchedBody)
-			if trimErr != nil {
-				return nil, fmt.Errorf("prepare Grok invalid encrypted_content retry: %w", trimErr)
-			}
-			if changed {
-				patchedBody = retryBody
-				didEncryptedTrim = true
-				slog.Info("grok_invalid_encrypted_content_retry", "account_id", account.ID, "cache_identity_present", cacheIdentity != "")
-				continue
-			}
+		if !isGrokInvalidEncryptedContentResponse(resp.StatusCode, respBody) {
+			resp.Body = io.NopCloser(bytes.NewReader(respBody))
+			break
 		}
 
-		// 2) reactive oversize compact: only after upstream confirms prompt too large
-		if !didOversizeCompact && isGrokPromptTooLargeResponse(http.StatusBadRequest, respBody) {
-			compacted, compactMeta, cerr := s.compactGrokPromptAfterOversize(upstreamCtx, c, account, patchedBody, upstreamModel)
-			if cerr != nil {
-				slog.Warn("grok_prompt_oversize_compact_failed",
-					"account_id", account.ID,
-					"model", upstreamModel,
-					"before_bytes", compactMeta.BeforeBytes,
-					"error", cerr.Error(),
-					"upstream_msg", sanitizeUpstreamErrorMessage(extractUpstreamErrorMessage(respBody)),
-				)
-				return nil, writeGrokPromptCompactFailed502(c, cerr.Error())
-			}
-			if compactMeta.Mode == "noop" || len(compacted) == 0 || bytes.Equal(compacted, patchedBody) {
-				slog.Warn("grok_prompt_oversize_compact_noop",
-					"account_id", account.ID,
-					"model", upstreamModel,
-					"before_bytes", len(patchedBody),
-				)
-				return nil, writeGrokPromptCompactFailed502(c, "no reduction possible")
-			}
-			// Re-apply cache identity / free function-tool route on the compacted body.
-			// Use original client body only for identity seeds that predate patching.
-			nextBody := compacted
-			if next, aerr := applyGrokResponsesCacheIdentity(nextBody, body, cacheIdentity, account.IsGrokOAuth()); aerr == nil {
-				nextBody = next
-			}
-			if next, aerr := applyGrokFreeMessagesFunctionToolCacheRoute(nextBody, body, account, cacheIdentity); aerr == nil {
-				nextBody = next
-			}
-			patchedBody = nextBody
-			didOversizeCompact = true
-			slog.Info("grok_prompt_oversize_compacted",
-				"account_id", account.ID,
-				"model", upstreamModel,
-				"mode", compactMeta.Mode,
-				"summary_account_id", compactMeta.SummaryAccount,
-				"dropped_items", compactMeta.DroppedItems,
-				"summary_chars", compactMeta.SummaryChars,
-				"before_bytes", compactMeta.BeforeBytes,
-				"after_bytes", compactMeta.AfterBytes,
-				"before_est_tokens", compactMeta.BeforeEstTokens,
-				"after_est_tokens", compactMeta.AfterEstTokens,
-			)
-			continue
+		retryBody, changed, trimErr := trimGrokInvalidEncryptedContentRetryBody(patchedBody)
+		if trimErr != nil {
+			return nil, fmt.Errorf("prepare Grok invalid encrypted_content retry: %w", trimErr)
+		}
+		if !changed {
+			resp.Body = io.NopCloser(bytes.NewReader(respBody))
+			break
 		}
 
-		// Post-compact still 400 oversize → hard 502 (do not loop).
-		if didOversizeCompact && isGrokPromptTooLargeResponse(http.StatusBadRequest, respBody) {
-			slog.Warn("grok_prompt_oversize_retry_still_too_large",
-				"account_id", account.ID,
-				"model", upstreamModel,
-				"body_bytes", len(patchedBody),
-			)
-			return nil, writeGrokPromptCompactFailed502(c, "still over limit after compact")
-		}
-
-		// Other 400s: restore body and fall through to normal error handling.
-		resp.Body = io.NopCloser(bytes.NewReader(respBody))
-		break
+		patchedBody = retryBody
+		slog.Info("grok_invalid_encrypted_content_retry", "account_id", account.ID, "cache_identity_present", cacheIdentity != "")
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -1285,6 +1223,19 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 			s.rateLimitGrok(ctx, account, resetAt)
 		}
 		// updateGrokUsageSnapshot installs both runtime and durable rate-limit state.
+	case http.StatusPaymentRequired:
+		// 402 = spending-limit / no credits. Permanent — auto-disable the account
+		// so it never gets scheduled again. The snapshot was already persisted above.
+		slog.Warn("grok_account_payment_required_disabling",
+			"account_id", account.ID,
+			"account_name", account.Name,
+		)
+		if s.accountRepo != nil {
+			_ = s.accountRepo.SetSchedulable(ctx, account.ID, false)
+			// Also block scheduling in-memory so the runtime doesn't re-pick it
+			// before the next snapshot refresh.
+			s.BlockAccountScheduling(account, time.Now().Add(365*24*time.Hour), "402")
+		}
 	default:
 		if statusCode >= 500 {
 			s.tempUnscheduleGrok(ctx, account, 2*time.Minute, "grok upstream temporary error")

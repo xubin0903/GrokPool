@@ -4,7 +4,7 @@
 
 Used by grok_register_ttk to support dropdown providers:
   cfworker, cloudflare, moemail, tempmail_lol, duckmail, gptmail,
-  maliapi, luckmail, skymail, cloudmail, freemail, opentrashmail, laoudo
+  maliapi, luckmail, mailnest, skymail, cloudmail, freemail, opentrashmail, laoudo
 """
 
 from __future__ import annotations
@@ -42,6 +42,8 @@ MAIL_PROVIDER_CHOICES = [
     ("gptmail", "GPTMail"),
     ("maliapi", "YYDS / MaliAPI"),
     ("luckmail", "LuckMail（接码/买邮）"),
+    ("mailnest", "MailNest（mailnest.top）"),
+    ("gmail_forward", "域名转发→Gmail（无限别名）"),
     ("skymail", "SkyMail"),
     ("cloudmail", "CloudMail"),
     ("freemail", "Freemail 自建"),
@@ -73,6 +75,15 @@ def normalize_provider(name: str) -> str:
         "tempmail.lol": "tempmail_lol",
         "yyds": "maliapi",
         "yy ds": "maliapi",
+        "mailnest.top": "mailnest",
+        "mailnest_top": "mailnest",
+        "迈巢": "mailnest",
+        "domain_forward": "gmail_forward",
+        "spaceship_forward": "gmail_forward",
+        "gmail_catchall": "gmail_forward",
+        "catchall": "gmail_forward",
+        "自有域名": "gmail_forward",
+        "域名转发": "gmail_forward",
     }
     if p in ("tempmailer", "inboxkitten", "inbox_kitten"):
         return "cfworker"
@@ -130,6 +141,19 @@ def extra_from_config(config: dict) -> dict:
         "luckmail_project_code": str(c.get("luckmail_project_code") or "grok").strip(),
         "luckmail_email_type": str(c.get("luckmail_email_type") or "").strip(),
         "luckmail_domain": str(c.get("luckmail_domain") or "").strip(),
+        "mailnest_base_url": str(c.get("mailnest_base_url") or "https://mailnest.top").strip(),
+        "mailnest_api_key": str(c.get("mailnest_api_key") or "").strip(),
+        "mailnest_project_code": str(c.get("mailnest_project_code") or "x-ai001").strip(),
+        "mailnest_sale_mode": str(c.get("mailnest_sale_mode") or "temporary").strip(),
+        "gmail_forward_domain": str(c.get("gmail_forward_domain") or "").strip(),
+        "gmail_imap_user": str(c.get("gmail_imap_user") or "").strip(),
+        "gmail_imap_password": str(c.get("gmail_imap_password") or "").strip(),
+        "gmail_imap_host": str(c.get("gmail_imap_host") or "imap.gmail.com").strip(),
+        "gmail_imap_port": str(c.get("gmail_imap_port") or "993").strip(),
+        "gmail_imap_folders": str(
+            c.get("gmail_imap_folders") or "INBOX,Spam,[Gmail]/Spam"
+        ).strip(),
+        "gmail_forward_local_len": str(c.get("gmail_forward_local_len") or "10").strip(),
         "laoudo_auth": str(c.get("laoudo_auth") or "").strip(),
         "laoudo_email": str(c.get("laoudo_email") or "").strip(),
         "laoudo_account_id": str(c.get("laoudo_account_id") or "").strip(),
@@ -150,6 +174,14 @@ def provider_ready(config: dict, provider: str) -> bool:
         )
     if p == "luckmail":
         return bool(str(c.get("luckmail_api_key") or "").strip())
+    if p == "mailnest":
+        return bool(str(c.get("mailnest_api_key") or "").strip())
+    if p == "gmail_forward":
+        return bool(
+            str(c.get("gmail_forward_domain") or "").strip()
+            and str(c.get("gmail_imap_user") or "").strip()
+            and str(c.get("gmail_imap_password") or "").strip()
+        )
     if p == "skymail":
         return bool(str(c.get("skymail_token") or "").strip())
     if p == "cloudmail":

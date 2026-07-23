@@ -36,15 +36,16 @@ const (
 	upstreamBillingProbeCycleInterval          = time.Minute
 	upstreamBillingProbeRequestTimeout         = 10 * time.Second
 	upstreamBillingProbeMaxBodyBytes           = 64 * 1024
-	upstreamBillingProbeMaxPerCycle            = 20
-	upstreamBillingProbeConcurrency            = 4
+	upstreamBillingProbeMaxPerCycle            = 1000
+	upstreamBillingProbeConcurrency            = 8
 	upstreamBillingProbeMaxDelay               = 24 * time.Hour
 	upstreamBillingProbeLeaderLockKey          = "upstream:billing:probe:leader"
 	upstreamBillingProbeLeaderLockTTL          = 2 * time.Minute
 )
 
-// UpstreamBillingProbeMaxBatchSize limits one manual batch and one runner cycle.
-const UpstreamBillingProbeMaxBatchSize = upstreamBillingProbeMaxPerCycle
+// UpstreamBillingProbeMaxBatchSize is the max IDs accepted by the manual batch API.
+	// Raised so admin bulk ops are not artificially capped at 20.
+const UpstreamBillingProbeMaxBatchSize = 5000
 
 var (
 	ErrUpstreamBillingProbeUnavailable = infraerrors.ServiceUnavailable(
@@ -457,11 +458,9 @@ func (s *UpstreamBillingProbeService) probeAccountWithMode(ctx context.Context, 
 	return snapshot, nil
 }
 
-// ProbeAccounts performs a bounded manual batch with the same concurrency limit as the runner.
+// ProbeAccounts performs a manual batch. Concurrency is limited by the shared
+// probe slot pool; do not silently truncate the request list.
 func (s *UpstreamBillingProbeService) ProbeAccounts(ctx context.Context, accountIDs []int64) []UpstreamBillingProbeResult {
-	if len(accountIDs) > upstreamBillingProbeMaxPerCycle {
-		accountIDs = accountIDs[:upstreamBillingProbeMaxPerCycle]
-	}
 	results := make([]UpstreamBillingProbeResult, len(accountIDs))
 	if s == nil || s.accountRepo == nil {
 		for i, accountID := range accountIDs {

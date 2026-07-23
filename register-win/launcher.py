@@ -33,7 +33,7 @@ if not VENV_PY.exists():
     VENV_PY = ROOT / ".venv" / "bin" / "python"
 
 PANEL_HOST = os.environ.get("PANEL_HOST", "127.0.0.1")
-PANEL_PORT = int(os.environ.get("PANEL_PORT", "8877"))
+PANEL_PORT = int(os.environ.get("PANEL_PORT", "9000"))
 PANEL_AUTH = os.environ.get("PANEL_AUTH", "0").strip() not in ("0", "false", "False", "no", "")
 PANEL_PASSWORD = os.environ.get("PANEL_PASSWORD", "admin")
 
@@ -202,6 +202,58 @@ def _main_impl() -> int:
     env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("CLASH_API", "http://127.0.0.1:9090")
     env.setdefault("ENABLE_CLASH_UI", "1")
+
+    # Sub2API auto-push credentials (config.json preferred; env already set wins)
+    def _cfg_str(*keys: str, default: str = "") -> str:
+        for k in keys:
+            v = cfg.get(k)
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s:
+                return s
+        return default
+
+    def _set_if_empty(key: str, value: str) -> None:
+        if value and not str(env.get(key) or "").strip():
+            env[key] = value
+
+    auto_push = cfg.get("auto_sub2_push", True)
+    if isinstance(auto_push, str):
+        auto_push = auto_push.strip().lower() not in ("0", "false", "no", "off")
+    env.setdefault("AUTO_SUB2_PUSH", "1" if auto_push else "0")
+    _set_if_empty("SUB2API_BASE_URL", _cfg_str("sub2api_base_url", "SUB2API_BASE_URL", default="http://127.0.0.1:18080"))
+    _set_if_empty("SUB2API_ADMIN_EMAIL", _cfg_str("sub2api_admin_email", "SUB2API_ADMIN_EMAIL"))
+    _set_if_empty("SUB2API_ADMIN_PASSWORD", _cfg_str("sub2api_admin_password", "SUB2API_ADMIN_PASSWORD"))
+    _set_if_empty("SUB2API_ADMIN_API_KEY", _cfg_str("sub2api_admin_api_key", "SUB2API_ADMIN_API_KEY"))
+    _set_if_empty("SUB2API_JWT", _cfg_str("sub2api_jwt", "SUB2API_JWT"))
+    _set_if_empty("SUB2_IMPORT_MODE", _cfg_str("sub2_import_mode", "SUB2_IMPORT_MODE", default="cpa-data"))
+
+    # Persist default group selection for panel UI
+    try:
+        gid = int(cfg.get("sub2_target_group_id") or 0)
+    except Exception:
+        gid = 0
+    if gid > 0:
+        group_cfg = {
+            "group_id": gid,
+            "group_name": _cfg_str("sub2_target_group_name"),
+            "group_platform": _cfg_str("sub2_target_group_platform", default="grok"),
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        group_path = ROOT / "data" / "sub2_group.json"
+        try:
+            group_path.parent.mkdir(parents=True, exist_ok=True)
+            if not group_path.exists() or int(json.loads(group_path.read_text(encoding="utf-8-sig") or "{}").get("group_id") or 0) <= 0:
+                group_path.write_text(json.dumps(group_cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                log(f"[*] Sub2 target group set to #{gid} ({group_cfg.get('group_name') or 'unnamed'})")
+        except Exception as e:
+            log(f"[!] write sub2_group.json failed: {e}")
+
+    if env.get("SUB2API_ADMIN_API_KEY") or (env.get("SUB2API_ADMIN_EMAIL") and env.get("SUB2API_ADMIN_PASSWORD")):
+        log(f"[+] Sub2 push creds ready → {env.get('SUB2API_BASE_URL')}")
+    else:
+        log("[!] Sub2 push creds missing in config.json (sub2api_admin_email/password or api_key)")
 
     panel_py = ROOT / "panel" / "app.py"
     if not panel_py.exists():

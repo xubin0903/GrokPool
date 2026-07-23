@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"fmt"
 	"strconv"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
@@ -101,8 +102,12 @@ func (h *AccountHandler) ProbeUpstreamBillingBatch(c *gin.Context) {
 		response.BadRequest(c, "Invalid request: "+err.Error())
 		return
 	}
-	if len(req.AccountIDs) == 0 || len(req.AccountIDs) > service.UpstreamBillingProbeMaxBatchSize {
-		response.BadRequest(c, "account_ids must contain between 1 and 20 items")
+	if len(req.AccountIDs) == 0 {
+		response.BadRequest(c, "account_ids is required")
+		return
+	}
+	if len(req.AccountIDs) > service.UpstreamBillingProbeMaxBatchSize {
+		response.BadRequest(c, fmt.Sprintf("account_ids max is %d per request", service.UpstreamBillingProbeMaxBatchSize))
 		return
 	}
 	seen := make(map[int64]struct{}, len(req.AccountIDs))

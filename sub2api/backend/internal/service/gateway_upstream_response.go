@@ -298,6 +298,14 @@ func extractUpstreamErrorMessage(body []byte) string {
 		return m
 	}
 
+	// xAI/Grok 风格：{"code":"invalid-argument","error":"This model's maximum prompt length..."}
+	// error 是字符串，不是 {message:...} 对象。
+	if errField := gjson.GetBytes(body, "error"); errField.Exists() && errField.Type == gjson.String {
+		if m := strings.TrimSpace(errField.String()); m != "" {
+			return m
+		}
+	}
+
 	// ChatGPT 内部 API 风格：{"detail":"..."}
 	if d := gjson.GetBytes(body, "detail").String(); strings.TrimSpace(d) != "" {
 		return d

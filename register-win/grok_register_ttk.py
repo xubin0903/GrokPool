@@ -130,7 +130,8 @@ DEFAULT_CONFIG = {
     "email_failover": True,
     "email_providers": [
         "cfworker","cloudflare","moemail","tempmail_lol","duckmail","gptmail",
-        "maliapi","luckmail","skymail","cloudmail","freemail","opentrashmail","laoudo","yyds",
+        "maliapi","luckmail","mailnest","gmail_forward","skymail","cloudmail",
+        "freemail","opentrashmail","laoudo","yyds",
     ],
     "moemail_api_url": "https://sall.cc",
     "moemail_api_key": "",
@@ -149,6 +150,17 @@ DEFAULT_CONFIG = {
     "luckmail_project_code": "grok",
     "luckmail_email_type": "",
     "luckmail_domain": "",
+    "mailnest_base_url": "https://mailnest.top",
+    "mailnest_api_key": "",
+    "mailnest_project_code": "x-ai001",
+    "mailnest_sale_mode": "temporary",
+    "gmail_forward_domain": "",
+    "gmail_imap_user": "",
+    "gmail_imap_password": "",
+    "gmail_imap_host": "imap.gmail.com",
+    "gmail_imap_port": "993",
+    "gmail_imap_folders": "INBOX,Spam,[Gmail]/Spam",
+    "gmail_forward_local_len": "10",
     "skymail_api_base": "https://api.skymail.ink",
     "skymail_token": "",
     "skymail_domain": "",
@@ -1444,6 +1456,14 @@ def email_provider_ready(provider: str) -> bool:
         return bool(str(config.get("cfworker_api_url") or config.get("cloudflare_api_base") or "").strip())
     if p == "luckmail":
         return bool(str(config.get("luckmail_api_key") or "").strip())
+    if p == "mailnest":
+        return bool(str(config.get("mailnest_api_key") or "").strip())
+    if p in ("gmail_forward", "domain_forward", "spaceship_forward", "gmail_catchall"):
+        return bool(
+            str(config.get("gmail_forward_domain") or "").strip()
+            and str(config.get("gmail_imap_user") or "").strip()
+            and str(config.get("gmail_imap_password") or "").strip()
+        )
     if p in ("maliapi", "yyds"):
         return bool(str(config.get("maliapi_api_key") or config.get("yyds_api_key") or config.get("yyds_jwt") or "").strip())
     return False
