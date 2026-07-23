@@ -189,6 +189,7 @@
           @delete="handleBulkDelete"
           @reset-status="handleBulkResetStatus"
           @refresh-token="handleBulkRefreshToken"
+          @batch-test="handleBulkTest"
           @probe-upstream-billing="handleBulkProbeUpstreamBilling"
           @probe-dead="handleBulkProbeDead"
           @delete-dead="handleBulkDeleteDead"
@@ -502,6 +503,7 @@ import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 import { useAuthStore } from '@/stores/auth'
 import { adminAPI } from '@/api/admin'
+import { buildApiUrl } from '@/api/url'
 import { useTableLoader } from '@/composables/useTableLoader'
 import { useSwipeSelect, type SwipeSelectVirtualContext } from '@/composables/useSwipeSelect'
 import { useTableSelection } from '@/composables/useTableSelection'
@@ -1535,10 +1537,6 @@ const handleBulkProbeUpstreamBilling = async () => {
     appStore.showError(t('admin.accounts.upstreamBilling.noEligibleAccounts'))
     return
   }
-  if (accountIDs.length > 20) {
-    appStore.showError(t('admin.accounts.upstreamBilling.batchLimit'))
-    return
-  }
   accountIDs.forEach(id => probingUpstreamBilling.add(id))
   try {
     const results = await adminAPI.accounts.probeUpstreamBillingBatch(accountIDs)
@@ -1596,10 +1594,6 @@ const runBulkGrokDeadProbe = async (deleteDead: boolean) => {
   }
   if (accountIDs.length === 0) {
     appStore.showError(t('admin.accounts.bulkActions.probeDeadNeedSelection'))
-    return
-  }
-  if (accountIDs.length > 50) {
-    appStore.showError(t('admin.accounts.bulkActions.probeDeadLimit'))
     return
   }
   const confirmKey = deleteDead
@@ -1672,6 +1666,96 @@ const runBulkGrokDeadProbe = async (deleteDead: boolean) => {
 
 const handleBulkProbeDead = async () => runBulkGrokDeadProbe(false)
 const handleBulkDeleteDead = async () => runBulkGrokDeadProbe(true)
+
+const handleBulkTest = async () => {
+  const accountIDs = [...selIds.value]
+  if (accountIDs.length === 0) {
+    appStore.showError(t('admin.accounts.bulkActions.batchTestNeedSelection'))
+    return
+  }
+  if (!confirm(t('admin.accounts.bulkActions.batchTestConfirm', { count: accountIDs.length }))) return
+
+  const concurrency = 6
+  let ok = 0
+  let failed = 0
+  const failedIds: number[] = []
+  let cursor = 0
+
+  const runOne = async (accountId: number) => {
+    try {
+      const url = buildApiUrl(`/admin/accounts/${accountId}/test`)
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${localStorage.getItem('auth_token')}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ model_id: '', prompt: 'hi', mode: 'default' })
+      })
+      if (!response.ok || !response.body) {
+        failed += 1
+        failedIds.push(accountId)
+        return
+      }
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let success = false
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const jsonStr = line.slice(6).trim()
+          if (!jsonStr) continue
+          try {
+            const event = JSON.parse(jsonStr)
+            if (event?.type === 'test_complete' && event?.success === true) {
+              success = true
+            }
+            if (event?.type === 'error') {
+              success = false
+            }
+          } catch {
+            // ignore parse errors
+          }
+        }
+      }
+      if (success) ok += 1
+      else {
+        failed += 1
+        failedIds.push(accountId)
+      }
+    } catch {
+      failed += 1
+      failedIds.push(accountId)
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, accountIDs.length) }, async () => {
+    while (cursor < accountIDs.length) {
+      const idx = cursor
+      cursor += 1
+      await runOne(accountIDs[idx])
+    }
+  })
+  await Promise.all(workers)
+
+  if (failed > 0) {
+    appStore.showError(
+      t('admin.accounts.bulkActions.batchTestPartial', {
+        success: ok,
+        failed,
+        failedIds: failedIds.slice(0, 20).join(',')
+      })
+    )
+  } else {
+    appStore.showSuccess(t('admin.accounts.bulkActions.batchTestSuccess', { count: ok }))
+  }
+}
 
 const updateSchedulableInList = (accountIds: number[], schedulable: boolean) => {
   if (accountIds.length === 0) return

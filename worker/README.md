@@ -16,7 +16,7 @@ Or:
 worker\start_worker.bat
 ```
 
-Panel: http://127.0.0.1:8877
+Panel: http://127.0.0.1:9000
 
 ## Prerequisites
 
@@ -35,7 +35,7 @@ Panel: http://127.0.0.1:8877
 | `SUB2API_BASE_URL` | http://127.0.0.1:18080 |
 | `GROK_BROWSER_ENGINE` | camoufox |
 | `GROK_PROXY` | http://127.0.0.1:7895 |
-| `PANEL_PORT` | 8877 |
+| `PANEL_PORT` | 9000 |
 
 ## Success logs
 

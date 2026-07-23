@@ -115,7 +115,23 @@ func (s *GrokQuotaService) QueryQuota(ctx context.Context, accountID int64) (*Gr
 			return probeResult, nil
 		}
 		if billingResult != nil && billingResult.Billing != nil {
+			billingResult.Source = "hybrid_probe"
 			billingResult.ProbeError = probeErr.Error()
+			// Keep the real chat probe status when billing was a green no-headers 200.
+			if status := infraerrors.FromError(probeErr); status != nil {
+				if code := int(status.Code); code >= 400 {
+					// mapUpstreamStatus may remap 402->502; recover original from message.
+					if embedded := extractEmbeddedUpstreamStatus(probeErr.Error()); embedded >= 400 {
+						billingResult.StatusCode = embedded
+					} else if code != http.StatusBadGateway {
+						billingResult.StatusCode = code
+					} else if embedded := extractEmbeddedUpstreamStatus(probeErr.Error()); embedded >= 400 {
+						billingResult.StatusCode = embedded
+					}
+				}
+			} else if embedded := extractEmbeddedUpstreamStatus(probeErr.Error()); embedded >= 400 {
+				billingResult.StatusCode = embedded
+			}
 			return billingResult, nil
 		}
 		if billingErr != nil {
@@ -238,7 +254,29 @@ func ClassifyGrokAccountLiveness(accountID int64, result *GrokQuotaProbeResult, 
 	}
 
 	combined := strings.ToLower(strings.TrimSpace(result.ProbeError + " " + out.EntitlementHint))
-	if out.StatusCode == http.StatusUnauthorized || isGrokPermanentDeadMessage(combined) {
+	// Hybrid path can keep billing StatusCode=200 while ProbeError carries the real
+	// chat 402 body ("upstream returned 402 ... spending-limit"). Prefer that status
+	// for classification so 402 isn't lost as "inconclusive".
+	if out.StatusCode < 400 {
+		if code := extractEmbeddedUpstreamStatus(combined); code >= 400 {
+			out.StatusCode = code
+		}
+	}
+
+	// 402 Payment Required (spending-limit / ran out of credits) is permanent
+	// for Free accounts — no automated recovery without manual top-up.
+	// Trust the message even when StatusCode is still a green billing probe.
+	if out.StatusCode == http.StatusPaymentRequired || isGrokPaymentRequiredDeadMessage(combined) {
+		out.Dead = true
+		out.Alive = false
+		out.Unknown = false
+		out.Reason = "payment_required_no_credits"
+		return out
+	}
+
+	// Only apply permanent-dead message heuristics when the upstream status is
+	// actually >=400. A 2xx probe without quota headers is inconclusive, not dead.
+	if out.StatusCode >= 400 && (out.StatusCode == http.StatusUnauthorized || isGrokPermanentDeadMessage(combined)) {
 		out.Dead = true
 		out.Alive = false
 		out.Unknown = false
@@ -304,6 +342,10 @@ func isGrokPermanentDeadMessage(msg string) bool {
 		"user is suspended",
 		"suspended",
 		"banned",
+		"spending-limit",
+		"spending_limit",
+		"run out of credits",
+		"personal-team-blocked",
 	}
 	for _, n := range needles {
 		if strings.Contains(msg, n) {
@@ -311,6 +353,61 @@ func isGrokPermanentDeadMessage(msg string) bool {
 		}
 	}
 	return false
+}
+
+// isGrokPaymentRequiredDeadMessage checks whether a probe error body indicates the
+// account is out of credits (402 spending-limit / need subscription).
+func isGrokPaymentRequiredDeadMessage(msg string) bool {
+	msg = strings.ToLower(strings.TrimSpace(msg))
+	if msg == "" {
+		return false
+	}
+	needles := []string{
+		"spending-limit",
+		"spending_limit",
+		"run out of credits",
+		"need a grok subscription",
+		"personal-team-blocked",
+		"no credits",
+		"out of credits",
+	}
+	for _, n := range needles {
+		if strings.Contains(msg, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractEmbeddedUpstreamStatus digs "upstream returned 402" out of wrapped probe errors
+// when the outer StatusCode is still a green billing probe.
+func extractEmbeddedUpstreamStatus(msg string) int {
+	msg = strings.ToLower(strings.TrimSpace(msg))
+	if msg == "" {
+		return 0
+	}
+	const marker = "upstream returned "
+	idx := strings.Index(msg, marker)
+	if idx < 0 {
+		return 0
+	}
+	rest := msg[idx+len(marker):]
+	n := 0
+	digits := 0
+	for _, ch := range rest {
+		if ch < '0' || ch > '9' {
+			break
+		}
+		n = n*10 + int(ch-'0')
+		digits++
+		if digits >= 3 {
+			break
+		}
+	}
+	if digits == 0 || n < 100 || n > 599 {
+		return 0
+	}
+	return n
 }
 
 // ProbeAccountLiveness runs QueryQuota and classifies the account.

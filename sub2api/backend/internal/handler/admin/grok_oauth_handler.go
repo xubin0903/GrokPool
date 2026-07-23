@@ -574,8 +574,10 @@ func (h *GrokOAuthHandler) ProbeDeadAccounts(c *gin.Context) {
 		response.BadRequest(c, "account_ids is required")
 		return
 	}
-	if len(req.AccountIDs) > 50 {
-		response.BadRequest(c, "account_ids max is 50 per request")
+	// Soft safety cap only — large enough for full-pool admin bulk ops.
+	const grokProbeDeadMaxBatch = 5000
+	if len(req.AccountIDs) > grokProbeDeadMaxBatch {
+		response.BadRequest(c, fmt.Sprintf("account_ids max is %d per request", grokProbeDeadMaxBatch))
 		return
 	}
 
@@ -669,9 +671,7 @@ func (h *GrokOAuthHandler) ProbeDeadAccounts(c *gin.Context) {
 				}
 				item.Reason = firstNonEmpty(item.Reason, "alive")
 			case live.Dead:
-				// Do NOT SetAccountError (it flips status to error and breaks token
-				// refresh / test-connection with "account state changed").
-				// Restore active if needed, then only disable scheduling + stamp notes.
+				// Permanently disable the account — 402/403/401 won't self-recover.
 				msg := "DEAD: " + live.Reason
 				if live.ProbeError != "" {
 					msg = msg + " | " + live.ProbeError
@@ -683,6 +683,12 @@ func (h *GrokOAuthHandler) ProbeDeadAccounts(c *gin.Context) {
 					if _, err := h.adminService.ClearAccountError(c.Request.Context(), accountID); err != nil {
 						slog.Warn("grok_probe_dead_restore_active_failed", "account_id", accountID, "error", err)
 					}
+				}
+				disabled := service.StatusDisabled
+				if _, err := h.adminService.UpdateAccount(c.Request.Context(), accountID, &service.UpdateAccountInput{
+					Status: disabled,
+				}); err != nil {
+					slog.Warn("grok_probe_dead_disable_status_failed", "account_id", accountID, "error", err)
 				}
 				if _, err := h.adminService.SetAccountSchedulable(c.Request.Context(), accountID, false); err != nil {
 					slog.Warn("grok_probe_dead_unschedulable_failed", "account_id", accountID, "error", err)

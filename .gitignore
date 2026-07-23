@@ -18,8 +18,15 @@ register-win/accounts_*.txt
 register-win/data/logs/**
 register-win/data/cpa/**
 register-win/data/sub2_group.json
+register-win/data/sub2_push_state.json
+register-win/data/_*.txt
 !register-win/data/logs/.gitkeep
 !register-win/data/cpa/.gitkeep
+.tmp_*
+sub2api/sub2api-linux
+sub2api/sub2api-windows.exe
+sub2api/sub2api.exe
+data/logs/
 **/.git/
 **/.git.bak-*/
 sub2api/.git.bak-upstream/

@@ -202,7 +202,7 @@ export default {
         disabled: 'Off',
         probeFailed: 'Failed to probe upstream rate',
         noEligibleAccounts: 'Select OpenAI API key accounts',
-        batchLimit: 'A batch can probe at most 20 accounts',
+        batchLimit: 'Batch probe size is no longer hard-capped at 20',
         batchCompleted: 'Probed {count} account(s)',
         batchPartial: 'Probe partially completed: {success} succeeded, {failed} failed'
       },
@@ -348,6 +348,11 @@ export default {
         resetStatus: 'Reset Status',
         refreshToken: 'Refresh Token',
         probeUpstreamBilling: 'Probe Upstream Rate',
+        batchTest: 'Batch Test',
+        batchTestConfirm: 'Run connection tests for {count} selected account(s) with prompt "hi". Continue?',
+        batchTestNeedSelection: 'Select accounts before batch testing',
+        batchTestSuccess: 'Batch test done: all {count} succeeded',
+        batchTestPartial: 'Batch test done: {success} succeeded, {failed} failed (sample failed IDs: {failedIds})',
         probeDead: 'Probe Dead Accounts',
         deleteDead: 'Delete Dead Accounts',
         deadToolsHint:
@@ -362,7 +367,7 @@ export default {
         deleteDeadNone:
           'No dead accounts deleted (probe: alive {alive} / dead {dead} / unknown {unknown}). Unknown accounts are kept to avoid false kills.',
         probeDeadNoGrok: 'Select Grok accounts first (use “Select this page”)',
-        probeDeadLimit: 'At most 50 accounts per probe batch',
+        probeDeadLimit: 'Batch probe size is no longer hard-capped at 50',
         probeDeadNeedSelection: 'Select accounts before probing dead ones',
         deadMarked: 'DEAD',
         resetStatusSuccess: 'Successfully reset {count} account(s) status',

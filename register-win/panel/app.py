@@ -52,7 +52,7 @@ BASE_DIR = Path(os.environ.get("GROK_REGISTER_DIR", str(_DEFAULT_ROOT))).resolve
 PANEL_AUTH = os.environ.get("PANEL_AUTH", "0").strip() not in ("0", "false", "False", "no", "")
 PANEL_PASSWORD = os.environ.get("PANEL_PASSWORD", "admin")
 HOST = os.environ.get("PANEL_HOST", "127.0.0.1")
-PORT = int(os.environ.get("PANEL_PORT", "8877"))
+PORT = int(os.environ.get("PANEL_PORT", "9000"))
 SECRET = os.environ.get("PANEL_SECRET", "grok-register-panel-local-secret")
 CLASH_API = os.environ.get("CLASH_API", "http://127.0.0.1:9090").rstrip("/")
 CLASH_SECRET = os.environ.get("CLASH_SECRET", "")
@@ -83,11 +83,11 @@ AUTO_CPA = os.environ.get("AUTO_CPA", "1").strip() not in ("0", "false", "False"
 CPA_DELAY = float(os.environ.get("CPA_DELAY", "1.0"))
 # GrokPool: after CPA convert, push OAuth account into local/remote Sub2API.
 # Default ON — free web SSO path dies fast; OAuth/cli-chat-proxy is the durable route.
+# Creds: env first, then config.json (hot-read each push so launcher/config fixes work without full re-code).
 AUTO_SUB2_PUSH = os.environ.get("AUTO_SUB2_PUSH", "1").strip() not in ("0", "false", "False", "no")
 # Import mode:
 #   sso-to-oauth  → Sub2 official POST /admin/grok/sso-to-oauth (server-side ConvertFromSSO)
 #   cpa-data      → local SSO→OAuth then POST /admin/accounts/data (type=oauth package)
-# Default sso-to-oauth so credentials/base_url match Sub2's own OAuth builder.
 # Default cpa-data: panel already did Authorization Code + PKCE with
 # referrer=grok-build via sso2cpa_core. Push ready OAuth package so Sub2 does
 # NOT re-run its (historically broken) device-flow converter.
@@ -109,6 +109,102 @@ SUB2_SKIP_DEFAULT_GROUP_BIND = os.environ.get("SUB2_SKIP_DEFAULT_GROUP_BIND", "0
 SUB2_PUSH_CONCURRENCY = int(os.environ.get("SUB2_PUSH_CONCURRENCY", "1") or "1")
 SUB2_PUSH_PRIORITY = int(os.environ.get("SUB2_PUSH_PRIORITY", "50") or "50")
 SUB2_GROUP_CFG_PATH = Path(os.environ.get("SUB2_GROUP_CFG", str(BASE_DIR / "data" / "sub2_group.json")))
+
+
+def _load_config_json() -> dict:
+    try:
+        if CONFIG_PATH.exists():
+            obj = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+            if isinstance(obj, dict):
+                return obj
+    except Exception:
+        pass
+    return {}
+
+
+def _sub2_cfg_str(cfg: dict, *keys: str, default: str = "") -> str:
+    for k in keys:
+        v = (cfg or {}).get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return default
+
+
+def refresh_sub2_settings_from_config(force: bool = False) -> dict:
+    """Merge config.json Sub2 settings into module globals (env still wins if already set).
+
+    Called before each push/status so filling config.json fixes a live panel without
+    needing env vars baked at process start. Does not override non-empty env values.
+    """
+    global AUTO_SUB2_PUSH, SUB2_IMPORT_MODE, SUB2API_BASE_URL
+    global SUB2API_ADMIN_EMAIL, SUB2API_ADMIN_PASSWORD, SUB2API_ADMIN_API_KEY, SUB2API_JWT
+    global SUB2_PUSH_CONCURRENCY, SUB2_PUSH_PRIORITY
+    cfg = _load_config_json()
+
+    def env_or_cfg(env_key: str, *cfg_keys: str, default: str = "") -> str:
+        ev = str(os.environ.get(env_key) or "").strip()
+        if ev:
+            return ev
+        return _sub2_cfg_str(cfg, *cfg_keys, default=default)
+
+    # auto push: env AUTO_SUB2_PUSH wins; else config auto_sub2_push; else keep current
+    if "AUTO_SUB2_PUSH" in os.environ:
+        AUTO_SUB2_PUSH = os.environ.get("AUTO_SUB2_PUSH", "1").strip() not in (
+            "0",
+            "false",
+            "False",
+            "no",
+        )
+    elif "auto_sub2_push" in cfg:
+        v = cfg.get("auto_sub2_push")
+        if isinstance(v, str):
+            AUTO_SUB2_PUSH = v.strip().lower() not in ("0", "false", "no", "off")
+        else:
+            AUTO_SUB2_PUSH = bool(v)
+
+    SUB2_IMPORT_MODE = (
+        env_or_cfg("SUB2_IMPORT_MODE", "sub2_import_mode", "SUB2_IMPORT_MODE", default="cpa-data")
+        .strip()
+        .lower()
+        or "cpa-data"
+    )
+    SUB2API_BASE_URL = env_or_cfg(
+        "SUB2API_BASE_URL", "sub2api_base_url", "SUB2API_BASE_URL", default="http://127.0.0.1:18080"
+    ).rstrip("/")
+    SUB2API_ADMIN_EMAIL = env_or_cfg(
+        "SUB2API_ADMIN_EMAIL", "sub2api_admin_email", "SUB2API_ADMIN_EMAIL"
+    )
+    SUB2API_ADMIN_PASSWORD = env_or_cfg(
+        "SUB2API_ADMIN_PASSWORD", "sub2api_admin_password", "SUB2API_ADMIN_PASSWORD"
+    )
+    SUB2API_ADMIN_API_KEY = env_or_cfg(
+        "SUB2API_ADMIN_API_KEY", "sub2api_admin_api_key", "SUB2API_ADMIN_API_KEY"
+    )
+    SUB2API_JWT = env_or_cfg("SUB2API_JWT", "sub2api_jwt", "SUB2API_JWT")
+
+    # optional group from config if state empty
+    try:
+        gid_cfg = int(cfg.get("sub2_target_group_id") or 0)
+    except Exception:
+        gid_cfg = 0
+    if gid_cfg > 0 and get_target_group_id() <= 0:
+        set_target_group(
+            gid_cfg,
+            _sub2_cfg_str(cfg, "sub2_target_group_name"),
+            _sub2_cfg_str(cfg, "sub2_target_group_platform", default="grok"),
+        )
+
+    return {
+        "enabled": AUTO_SUB2_PUSH,
+        "base_url": SUB2API_BASE_URL,
+        "import_mode": SUB2_IMPORT_MODE,
+        "has_api_key": bool(SUB2API_ADMIN_API_KEY),
+        "has_password": bool(SUB2API_ADMIN_EMAIL and SUB2API_ADMIN_PASSWORD),
+        "target_group_id": get_target_group_id(),
+    }
 # Hard wall-clock per register round (one account). Stuck process is killed, next round starts.
 DEFAULT_ROUND_TIMEOUT_SEC = 300
 # Optional: talk to local Clash Meta external-controller for node list.
@@ -376,6 +472,102 @@ def unique_accounts() -> List[dict]:
     return out
 
 
+def active_account_emails() -> Set[str]:
+    """Emails still present in remaining accounts_*.txt (panel account list)."""
+    emails: Set[str] = set()
+    for acc in unique_accounts():
+        email = str(acc.get("email") or "").strip().lower()
+        if email:
+            emails.add(email)
+    return emails
+
+
+def _cpa_entry_email(obj: Optional[dict], path: Optional[Path] = None) -> str:
+    """Best-effort email for a CPA json object / filename."""
+    if isinstance(obj, dict):
+        email = str(obj.get("email") or "").strip().lower()
+        if email:
+            return email
+        # Some older dumps only keep email under nested keys.
+        for key in ("preferred_username", "user", "account"):
+            email = str(obj.get(key) or "").strip().lower()
+            if email and "@" in email:
+                return email
+    if path is not None:
+        stem = path.stem
+        hint = stem[4:] if stem.lower().startswith("xai-") else stem
+        hint = str(hint or "").strip().lower()
+        # Strip optional -fingerprint suffix: email-abcdef12
+        if "@" in hint:
+            # If suffix looks like short hex after last '-', drop it when base still has @
+            parts = hint.rsplit("-", 1)
+            if len(parts) == 2 and len(parts[1]) in (6, 8, 10, 12) and all(
+                c in "0123456789abcdef" for c in parts[1]
+            ):
+                if "@" in parts[0]:
+                    return parts[0]
+            return hint
+    return ""
+
+
+def list_active_cpa_files() -> List[Path]:
+    """CPA files whose email still exists in remaining accounts_*.txt.
+
+    TXT export already only reads remaining account files. Sub2/CPA downloads
+    previously dumped the whole data/cpa tree (every historical conversion),
+    which is wrong after the user deletes account batches in the panel.
+    """
+    active = active_account_emails()
+    if not active:
+        return []
+    out: List[Path] = []
+    for path in list_cpa_files():
+        obj = None
+        try:
+            raw = path.read_text(encoding="utf-8")
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                obj = parsed
+        except Exception:
+            obj = None
+        email = _cpa_entry_email(obj, path)
+        if email and email in active:
+            out.append(path)
+    return out
+
+
+def prune_orphan_cpa_files() -> Dict[str, int]:
+    """Delete CPA json files for emails no longer in any accounts_*.txt."""
+    active = active_account_emails()
+    removed = 0
+    kept = 0
+    errors = 0
+    for path in list_cpa_files():
+        obj = None
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                obj = parsed
+        except Exception:
+            obj = None
+        email = _cpa_entry_email(obj, path)
+        # Keep unreadable/unknown files rather than nuking them blindly.
+        if not email:
+            kept += 1
+            continue
+        if email in active:
+            kept += 1
+            continue
+        try:
+            path.unlink()
+            removed += 1
+            log_line(f"[*] 已清理孤儿 CPA: {path.name} ({email})")
+        except Exception as e:
+            errors += 1
+            log_line(f"[!] 清理 CPA 失败 {path.name}: {e}")
+    return {"removed": removed, "kept": kept, "errors": errors, "active_emails": len(active)}
+
+
 def safe_filename_part(s: str) -> str:
     s = re.sub(r"[^\w.@+-]+", "_", s or "unknown")
     return s[:80] or "unknown"
@@ -451,8 +643,12 @@ def cpa_stats() -> dict:
     with _cpa_lock:
         st = dict(_cpa_state)
         done_n = len(_cpa_done)
-    files = list_cpa_files()
-    st["files"] = len(files)
+    all_files = list_cpa_files()
+    active_files = list_active_cpa_files()
+    # UI / download scope: only CPA still covered by remaining accounts_*.txt
+    st["files"] = len(active_files)
+    st["files_active"] = len(active_files)
+    st["files_all"] = len(all_files)
     st["done"] = done_n
     st["dir"] = str(CPA_DIR)
     return st
@@ -690,6 +886,10 @@ def set_target_group(group_id: int, group_name: str = "", group_platform: str = 
 
 
 def sub2_status() -> dict:
+    try:
+        refresh_sub2_settings_from_config()
+    except Exception:
+        pass
     with _sub2_lock:
         return {
             "enabled": AUTO_SUB2_PUSH,
@@ -756,6 +956,10 @@ def _sub2_login_jwt() -> str:
 
 
 def _sub2_auth_headers() -> dict:
+    try:
+        refresh_sub2_settings_from_config()
+    except Exception:
+        pass
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if SUB2API_ADMIN_API_KEY:
         headers["x-api-key"] = SUB2API_ADMIN_API_KEY
@@ -1087,6 +1291,10 @@ def push_cpa_to_sub2api(cpa_entry: dict, email_hint: str = "") -> Tuple[bool, st
     Default: Sub2 official sso-to-oauth (server-side ConvertFromSSO).
     Fallback: local CPA OAuth package via /admin/accounts/data.
     """
+    try:
+        refresh_sub2_settings_from_config()
+    except Exception as e:
+        log_line(f"[SUB2] refresh settings: {e}")
     if not AUTO_SUB2_PUSH:
         return False, "auto_sub2_push disabled"
 
@@ -1239,6 +1447,8 @@ def email_config_public(cfg: Optional[dict] = None) -> dict:
         {"id": "gptmail", "label": "GPTMail"},
         {"id": "maliapi", "label": "YYDS / MaliAPI"},
         {"id": "luckmail", "label": "LuckMail（接码/买邮）"},
+        {"id": "mailnest", "label": "MailNest（mailnest.top）"},
+        {"id": "gmail_forward", "label": "域名转发→Gmail（无限别名）"},
         {"id": "skymail", "label": "SkyMail"},
         {"id": "cloudmail", "label": "CloudMail"},
         {"id": "freemail", "label": "Freemail 自建"},
@@ -1293,6 +1503,19 @@ def email_config_public(cfg: Optional[dict] = None) -> dict:
         "luckmail_api_key": str(c.get("luckmail_api_key") or "").strip(),
         "luckmail_project_code": str(c.get("luckmail_project_code") or "grok").strip(),
         "luckmail_domain": str(c.get("luckmail_domain") or "").strip(),
+        "mailnest_base_url": str(c.get("mailnest_base_url") or "https://mailnest.top").strip(),
+        "mailnest_api_key": str(c.get("mailnest_api_key") or "").strip(),
+        "mailnest_project_code": str(c.get("mailnest_project_code") or "x-ai001").strip(),
+        "mailnest_sale_mode": str(c.get("mailnest_sale_mode") or "temporary").strip(),
+        "gmail_forward_domain": str(c.get("gmail_forward_domain") or "").strip(),
+        "gmail_imap_user": str(c.get("gmail_imap_user") or "").strip(),
+        "gmail_imap_password": str(c.get("gmail_imap_password") or "").strip(),
+        "gmail_imap_host": str(c.get("gmail_imap_host") or "imap.gmail.com").strip(),
+        "gmail_imap_port": str(c.get("gmail_imap_port") or "993").strip(),
+        "gmail_imap_folders": str(
+            c.get("gmail_imap_folders") or "INBOX,Spam,[Gmail]/Spam"
+        ).strip(),
+        "gmail_forward_local_len": str(c.get("gmail_forward_local_len") or "10").strip(),
         "skymail_api_base": str(c.get("skymail_api_base") or "https://api.skymail.ink").strip(),
         "skymail_token": str(c.get("skymail_token") or "").strip(),
         "skymail_domain": str(c.get("skymail_domain") or "").strip(),
@@ -1324,9 +1547,13 @@ def apply_email_config_from_ui(data: dict) -> dict:
     if provider == "yyds":
         provider = "maliapi"
 
+    if provider in ("domain_forward", "spaceship_forward", "gmail_catchall", "catchall"):
+        provider = "gmail_forward"
+
     valid = {
         "cfworker", "cloudflare", "moemail", "tempmail_lol", "duckmail", "gptmail",
-        "maliapi", "luckmail", "skymail", "cloudmail", "freemail", "opentrashmail", "laoudo",
+        "maliapi", "luckmail", "mailnest", "gmail_forward", "skymail", "cloudmail",
+        "freemail", "opentrashmail", "laoudo",
     }
     if provider not in valid:
         raise ValueError(f"不支持的邮箱源: {provider}")
@@ -1363,6 +1590,9 @@ def apply_email_config_from_ui(data: dict) -> dict:
         "duckmail_api_url", "duckmail_provider_url", "duckmail_bearer", "duckmail_domain", "duckmail_api_key",
         "maliapi_base_url", "maliapi_api_key", "maliapi_domain",
         "luckmail_base_url", "luckmail_api_key", "luckmail_project_code", "luckmail_domain",
+        "mailnest_base_url", "mailnest_api_key", "mailnest_project_code", "mailnest_sale_mode",
+        "gmail_forward_domain", "gmail_imap_user", "gmail_imap_password",
+        "gmail_imap_host", "gmail_imap_port", "gmail_imap_folders", "gmail_forward_local_len",
         "skymail_api_base", "skymail_token", "skymail_domain",
         "cloudmail_api_base", "cloudmail_admin_email", "cloudmail_admin_password", "cloudmail_domain",
         "freemail_api_url", "freemail_admin_token", "freemail_domain",
@@ -1381,6 +1611,8 @@ def apply_email_config_from_ui(data: dict) -> dict:
         "cfworker": ["cfworker_api_url"],
         "cloudflare": ["cloudflare_api_base"],
         "luckmail": ["luckmail_api_key"],
+        "mailnest": ["mailnest_api_key"],
+        "gmail_forward": ["gmail_forward_domain", "gmail_imap_user", "gmail_imap_password"],
         "skymail": ["skymail_token"],
         "cloudmail": ["cloudmail_api_base"],
         "freemail": ["freemail_api_url"],
@@ -1741,6 +1973,12 @@ def _run_one_round(round_no: int, total: int) -> bool:
         free_ok = mail_prov in ("tempmail_lol", "moemail", "gptmail", "duckmail")
         has_cf = bool(str(mail_cfg.get("cfworker_api_url") or mail_cfg.get("cloudflare_api_base") or "").strip())
         has_luck = bool(str(mail_cfg.get("luckmail_api_key") or "").strip())
+        has_mailnest = bool(str(mail_cfg.get("mailnest_api_key") or "").strip())
+        has_gmail_fwd = bool(
+            str(mail_cfg.get("gmail_forward_domain") or "").strip()
+            and str(mail_cfg.get("gmail_imap_user") or "").strip()
+            and str(mail_cfg.get("gmail_imap_password") or "").strip()
+        )
         has_mali = bool(str(mail_cfg.get("maliapi_api_key") or mail_cfg.get("yyds_api_key") or "").strip())
         has_sky = bool(str(mail_cfg.get("skymail_token") or "").strip())
         has_cloud = bool(str(mail_cfg.get("cloudmail_api_base") or "").strip())
@@ -1752,6 +1990,10 @@ def _run_one_round(round_no: int, total: int) -> bool:
             ok = has_cf
         elif mail_prov == "luckmail":
             ok = has_luck
+        elif mail_prov == "mailnest":
+            ok = has_mailnest
+        elif mail_prov in ("gmail_forward", "domain_forward", "spaceship_forward", "gmail_catchall"):
+            ok = has_gmail_fwd
         elif mail_prov in ("maliapi", "yyds"):
             ok = has_mali
         elif mail_prov == "skymail":
@@ -2413,6 +2655,64 @@ INDEX_HTML = r"""
       </div>
     </div>
 
+    <div id="box_mailnest" class="mail-box" style="display:none;margin-top:10px">
+      <div class="row">
+        <label style="flex:2">平台地址
+          <input type="text" id="mailnest_base_url" placeholder="https://mailnest.top"/>
+        </label>
+        <label>API Key
+          <input type="password" id="mailnest_api_key" placeholder="sk_..."/>
+        </label>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label>项目代号
+          <input type="text" id="mailnest_project_code" placeholder="x-ai001"/>
+        </label>
+        <label>购买模式
+          <select id="mailnest_sale_mode">
+            <option value="temporary">temporary 临时邮箱</option>
+            <option value="exclusive">exclusive 专属邮箱</option>
+          </select>
+        </label>
+      </div>
+      <div style="margin-top:8px;opacity:.75;font-size:12px">
+        Grok/xAI 用 project_code=<code>x-ai001</code>。库存为 0 时购买会失败，面板保存不扣费。
+      </div>
+    </div>
+
+    <div id="box_gmail_forward" class="mail-box" style="display:none;margin-top:10px">
+      <div class="row">
+        <label style="flex:1.2">你的域名
+          <input type="text" id="gmail_forward_domain" placeholder="your-domain.com"/>
+        </label>
+        <label style="flex:1.5">Gmail 地址
+          <input type="text" id="gmail_imap_user" placeholder="you@gmail.com"/>
+        </label>
+        <label style="flex:1.5">应用专用密码
+          <input type="password" id="gmail_imap_password" placeholder="xxxx xxxx xxxx xxxx"/>
+        </label>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label>IMAP 主机
+          <input type="text" id="gmail_imap_host" placeholder="imap.gmail.com"/>
+        </label>
+        <label style="max-width:100px">端口
+          <input type="text" id="gmail_imap_port" placeholder="993"/>
+        </label>
+        <label style="flex:2">扫描文件夹
+          <input type="text" id="gmail_imap_folders" placeholder="INBOX,Spam,[Gmail]/Spam"/>
+        </label>
+        <label style="max-width:110px">别名长度
+          <input type="text" id="gmail_forward_local_len" placeholder="10"/>
+        </label>
+      </div>
+      <div style="margin-top:8px;opacity:.75;font-size:12px">
+        原理：每次随机 <code>xxx@你的域名</code> 去注册 Grok；Spaceship 免费邮箱转发到 Gmail；脚本用 IMAP 读 Gmail 提验证码。
+        必须开启<strong>通配/catch-all 转发</strong>（任意前缀都能进 Gmail），Gmail 开 IMAP +
+        <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener">应用专用密码</a>（不是登录密码）。
+      </div>
+    </div>
+
     <div id="box_skymail" class="mail-box" style="display:none;margin-top:10px">
       <div class="row">
         <label style="flex:2">API Base
@@ -2505,7 +2805,7 @@ INDEX_HTML = r"""
         <button class="btn danger" type="button" onclick="deleteSelectedFiles()">删除选中</button>
       </div>
     </div>
-    <div class="muted" style="padding:8px 14px 0;font-size:12px">勾选已下载/不需要的 accounts_*.txt，删除后不会再出现在「下载 SSO」合并结果里。</div>
+    <div class="muted" style="padding:8px 14px 0;font-size:12px">勾选已下载/不需要的 accounts_*.txt，删除后不会再出现在「下载 SSO / CPA / Sub2」导出结果里（历史 CPA 也会按邮箱过滤/清理）。</div>
     {% if files %}
     <table>
       <thead>
@@ -2605,6 +2905,17 @@ async function loadEmailConfig(){
     _set('luckmail_api_key', e.luckmail_api_key);
     _set('luckmail_project_code', e.luckmail_project_code||'grok');
     _set('luckmail_domain', e.luckmail_domain);
+    _set('mailnest_base_url', e.mailnest_base_url||'https://mailnest.top');
+    _set('mailnest_api_key', e.mailnest_api_key);
+    _set('mailnest_project_code', e.mailnest_project_code||'x-ai001');
+    _set('mailnest_sale_mode', e.mailnest_sale_mode||'temporary');
+    _set('gmail_forward_domain', e.gmail_forward_domain||'');
+    _set('gmail_imap_user', e.gmail_imap_user||'');
+    _set('gmail_imap_password', e.gmail_imap_password||'');
+    _set('gmail_imap_host', e.gmail_imap_host||'imap.gmail.com');
+    _set('gmail_imap_port', e.gmail_imap_port||'993');
+    _set('gmail_imap_folders', e.gmail_imap_folders||'INBOX,Spam,[Gmail]/Spam');
+    _set('gmail_forward_local_len', e.gmail_forward_local_len||'10');
     _set('skymail_api_base', e.skymail_api_base||'https://api.skymail.ink');
     _set('skymail_token', e.skymail_token);
     _set('skymail_domain', e.skymail_domain);
@@ -2660,6 +2971,17 @@ async function saveEmailConfig(){
     luckmail_api_key: _val('luckmail_api_key'),
     luckmail_project_code: _val('luckmail_project_code'),
     luckmail_domain: _val('luckmail_domain'),
+    mailnest_base_url: _val('mailnest_base_url'),
+    mailnest_api_key: _val('mailnest_api_key'),
+    mailnest_project_code: _val('mailnest_project_code'),
+    mailnest_sale_mode: _val('mailnest_sale_mode')||'temporary',
+    gmail_forward_domain: _val('gmail_forward_domain'),
+    gmail_imap_user: _val('gmail_imap_user'),
+    gmail_imap_password: _val('gmail_imap_password'),
+    gmail_imap_host: _val('gmail_imap_host')||'imap.gmail.com',
+    gmail_imap_port: _val('gmail_imap_port')||'993',
+    gmail_imap_folders: _val('gmail_imap_folders')||'INBOX,Spam,[Gmail]/Spam',
+    gmail_forward_local_len: _val('gmail_forward_local_len')||'10',
     skymail_api_base: _val('skymail_api_base'),
     skymail_token: _val('skymail_token'),
     skymail_domain: _val('skymail_domain'),
@@ -2852,7 +3174,10 @@ async function poll(){
     document.getElementById('st_sf').textContent=`${st.success||0} / ${st.fail||0}`;
     document.getElementById('btn_start').disabled=!!st.running;
     if(document.getElementById('st_cpa_ok')){
-      document.getElementById('st_cpa_ok').textContent=String(cpa.files||0);
+      // Prefer active-export count; fall back to files.
+      document.getElementById('st_cpa_ok').textContent=String(
+        (cpa.files_active!=null?cpa.files_active:cpa.files)||0
+      );
     }
     if(document.getElementById('st_cpa_q')){
       document.getElementById('st_cpa_q').textContent=
@@ -2867,8 +3192,13 @@ async function poll(){
       const sub2txt = sub2.enabled
         ? (` · Sub2推送:开 ${sub2.ok||0}成/${sub2.fail||0}败 · ${tgt}` + (sub2.last_error?(' 错:'+sub2.last_error):''))
         : ' · Sub2推送:关';
+      const activeN = (cpa.files_active!=null?cpa.files_active:cpa.files)||0;
+      const allN = (cpa.files_all!=null?cpa.files_all:cpa.files)||0;
+      const fileTxt = (allN && allN!==activeN)
+        ? (`当前可导出 ${activeN} / 历史 ${allN}`)
+        : (`当前可导出 ${activeN}`);
       document.getElementById('cpa_hint').textContent =
-        `代理走本机 Clash · 自动CPA: ${cpa.enabled?'开':'关'} · ${core} · 文件 ${cpa.files||0}${last}${err}${sub2txt}`;
+        `代理走本机 Clash · 自动CPA: ${cpa.enabled?'开':'关'} · ${core} · ${fileTxt}${last}${err}${sub2txt}`;
       renderSub2Status(sub2);
     }
     const box=document.getElementById('logbox');
@@ -2973,7 +3303,7 @@ def index():
         files=files_meta,
         file_count=len(files_meta),
         account_count=total,
-        cpa_files=len(list_cpa_files()),
+        cpa_files=len(list_active_cpa_files()),
     )
 
 
@@ -3097,11 +3427,14 @@ def download_accounts_json():
 
 @app.get("/download/cpa.zip")
 def download_cpa_zip():
-    """主接口 2：已自动 OAuth 转换的真 CPA JSON（auth_kind=oauth）。"""
+    """主接口 2：已自动 OAuth 转换的真 CPA JSON（auth_kind=oauth）。
+
+    只导出「当前账号文件里还在」的邮箱对应 CPA，和下载 SSO TXT 口径一致。
+    """
     need = require_login()
     if need:
         return need
-    files = list_cpa_files()
+    files = list_active_cpa_files()
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         readme = (
@@ -3110,8 +3443,9 @@ def download_cpa_zip():
             "1) 每个 xai-*.json 是 OAuth 凭证（access_token + refresh_token）。\n"
             "2) auth_kind=oauth，可直接放进 CLIProxyAPI auth-dir。\n"
             "3) 由注册成功后的 web SSO 自动换票生成。\n"
-            "4) all.json 为全部账号数组；failed.jsonl 为转换失败记录（若有）。\n"
-            "5) 若 zip 为空：先注册，或点「补转未转换 CPA」。\n"
+            "4) all.json 为当前账号列表内邮箱的合集（与面板 accounts_*.txt 对齐）。\n"
+            "5) 面板删除账号文件后，对应历史 CPA 不会再被导出。\n"
+            "6) 若 zip 为空：先注册，或点「补转未转换 CPA」。\n"
         )
         zf.writestr("README.txt", readme)
         all_entries = []
@@ -3136,7 +3470,9 @@ def download_cpa_zip():
         if not files:
             zf.writestr(
                 "EMPTY.txt",
-                "暂无已转换的 CPA 文件。注册成功后会自动转换，或点击面板「补转未转换 CPA」。\n",
+                "当前账号列表没有可导出的 CPA。\n"
+                "若你刚删了 accounts_*.txt，历史 CPA 已按邮箱过滤掉。\n"
+                "需要导出：保留对应账号文件，或重新注册 / 补转 CPA。\n",
             )
     buf.seek(0)
     fname = f"cpa_oauth_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
@@ -3146,19 +3482,26 @@ def download_cpa_zip():
 
 
 def _load_cpa_entries_for_sub2() -> Tuple[List[dict], List[str]]:
-    """Read existing CPA JSON files for Sub2 export. No re-OAuth."""
+    """Read CPA JSON for Sub2 export, filtered to remaining account emails.
+
+    No re-OAuth. Aligns with SSO TXT export scope (remaining accounts_*.txt).
+    """
     entries: List[dict] = []
     name_hints: List[str] = []
-    for p in list_cpa_files():
+    for p in list_active_cpa_files():
         try:
             obj = json.loads(p.read_text(encoding="utf-8"))
             if not isinstance(obj, dict):
                 continue
             entries.append(obj)
-            # xai-email.json → email hint; strip optional -fingerprint suffix
-            stem = p.stem
-            hint = stem[4:] if stem.lower().startswith("xai-") else stem
-            name_hints.append(hint or "")
+            # Prefer real email field; fall back to filename stem.
+            email = _cpa_entry_email(obj, p)
+            if email:
+                name_hints.append(email)
+            else:
+                stem = p.stem
+                hint = stem[4:] if stem.lower().startswith("xai-") else stem
+                name_hints.append(hint or "")
         except Exception:
             continue
     return entries, name_hints
@@ -3263,11 +3606,12 @@ def download_sub2_zip():
     """主接口 3：Sub2API 官方导入包 ZIP（对齐 CPA zip 结构）。
 
     从已转换的 CPA JSON 现场映射，不重新注册/换票。
+    仅包含当前 accounts_*.txt 里还在的邮箱（与下载 SSO 一致）。
 
     zip 内容：
       README.txt
       grok-*.json     — 每个账号一份完整 sub2api-data（可单独导入）
-      all.json        — 全部账号合集（推荐一键导入）
+      all.json        — 当前账号合集（推荐一键导入）
       EMPTY.txt       — 无账号时的说明
     """
     need = require_login()
@@ -3281,13 +3625,14 @@ def download_sub2_zip():
         readme = (
             "Grok Register → Sub2API 官方导入包 (sub2api-data)\n"
             "================================================\n\n"
-            "1) all.json：全部账号合集，推荐直接导入 Sub2API。\n"
+            "1) all.json：当前账号合集，推荐直接导入 Sub2API。\n"
             "   管理后台 → 账号 → 导入数据 → 上传 all.json\n"
             "2) grok-*.json：每个账号一份完整 sub2api-data（也可单独导入）。\n"
             "3) type=sub2api-data / version=1 / platform=grok / type=oauth\n"
             "4) 由已转换的 CPA OAuth 凭证现场映射，不重新注册/换票。\n"
-            "5) proxies 为空；导入后请在 Sub2API 里绑定分组/代理。\n"
-            "6) 若 zip 为空：先注册，或点面板「补转未转换 CPA」。\n"
+            "5) 导出范围与面板账号文件一致：删除 accounts_*.txt 后不会再导出历史号。\n"
+            "6) proxies 为空；导入后请在 Sub2API 里绑定分组/代理。\n"
+            "7) 若 zip 为空：先注册，或点面板「补转未转换 CPA」。\n"
         )
         zf.writestr("README.txt", readme)
 
@@ -3313,8 +3658,9 @@ def download_sub2_zip():
         if not accounts:
             zf.writestr(
                 "EMPTY.txt",
-                "暂无已转换账号。注册成功后会自动转 CPA，再点「下载 Sub2」；"
-                "或先点面板「补转未转换 CPA」。\n",
+                "当前账号列表没有可导出的 Sub2 账号。\n"
+                "面板删除 accounts_*.txt 后，对应历史 CPA/Sub2 不会再被导出。\n"
+                "需要导出：保留账号文件，或重新注册 / 补转 CPA。\n",
             )
 
     buf.seek(0)
@@ -3403,7 +3749,11 @@ def api_nodes_select():
 
 @app.post("/api/accounts/delete")
 def api_accounts_delete():
-    """Delete selected accounts_*.txt files (after user downloaded them)."""
+    """Delete selected accounts_*.txt files (after user downloaded them).
+
+    Also prune orphan CPA json for emails that no longer appear in any remaining
+    account file, so Sub2/CPA exports stay aligned with the panel list.
+    """
     need = require_login()
     if need:
         return need
@@ -3430,16 +3780,30 @@ def api_accounts_delete():
         except Exception as e:
             errors.append(f"{name}: {e}")
 
+    pruned = {"removed": 0, "kept": 0, "errors": 0, "active_emails": 0}
+    if deleted:
+        try:
+            pruned = prune_orphan_cpa_files()
+        except Exception as e:
+            log_line(f"[!] 清理孤儿 CPA 失败: {e}")
+            pruned = {"removed": 0, "kept": 0, "errors": 1, "active_emails": 0, "error": str(e)}
+
     if not deleted and errors:
         return jsonify({"ok": False, "error": "; ".join(errors)}), 400
+    msg = f"已删除 {len(deleted)} 个文件"
+    if missing:
+        msg += f"，跳过 {len(missing)}"
+    removed_cpa = int(pruned.get("removed") or 0)
+    if removed_cpa:
+        msg += f"，并清理 {removed_cpa} 个历史 CPA"
     return jsonify(
         {
             "ok": True,
             "deleted": deleted,
             "missing": missing,
             "errors": errors,
-            "message": f"已删除 {len(deleted)} 个文件"
-            + (f"，跳过 {len(missing)}" if missing else ""),
+            "pruned_cpa": pruned,
+            "message": msg,
         }
     )
 
@@ -3715,6 +4079,10 @@ def health():
 # start background CPA worker when module loads (systemd imports/runs this file)
 start_cpa_worker()
 _init_sub2_group_state()
+try:
+    refresh_sub2_settings_from_config(force=True)
+except Exception as _e:
+    print(f"[SUB2] initial settings load: {_e}")
 
 
 if __name__ == "__main__":
@@ -3722,6 +4090,7 @@ if __name__ == "__main__":
     print(f"CPA auto-convert dir -> {CPA_DIR} core={_CPA_CORE_OK}")
     print(
         f"Sub2 push={AUTO_SUB2_PUSH} mode={SUB2_IMPORT_MODE} "
-        f"base={SUB2API_BASE_URL} group_id={get_target_group_id()}"
+        f"base={SUB2API_BASE_URL} group_id={get_target_group_id()} "
+        f"creds={'api_key' if SUB2API_ADMIN_API_KEY else ('password' if SUB2API_ADMIN_EMAIL else 'MISSING')}"
     )
     app.run(host=HOST, port=PORT, debug=False, threaded=True)

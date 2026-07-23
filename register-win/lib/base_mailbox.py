@@ -331,6 +331,14 @@ def create_mailbox(
             domain=extra.get("luckmail_domain", ""),
             proxy=proxy,
         )
+    elif provider in {"mailnest", "mailnest_top"}:
+        return MailNestMailbox(
+            base_url=extra.get("mailnest_base_url") or "https://mailnest.top",
+            api_key=extra.get("mailnest_api_key", ""),
+            project_code=extra.get("mailnest_project_code") or "x-ai001",
+            sale_mode=extra.get("mailnest_sale_mode") or "temporary",
+            proxy=proxy,
+        )
     elif provider in {"outlook", "microsoft"}:
         return OutlookMailbox(
             imap_server=extra.get("outlook_imap_server", ""),
@@ -340,11 +348,337 @@ def create_mailbox(
             graph_api_base=extra.get("outlook_graph_api_base", ""),
             proxy=proxy,
         )
+    elif provider in {
+        "gmail_forward",
+        "domain_forward",
+        "spaceship_forward",
+        "gmail_catchall",
+    }:
+        return GmailForwardMailbox(
+            domain=extra.get("gmail_forward_domain")
+            or extra.get("domain_forward_domain")
+            or "",
+            imap_user=extra.get("gmail_imap_user") or "",
+            imap_password=extra.get("gmail_imap_password") or "",
+            imap_host=extra.get("gmail_imap_host") or "imap.gmail.com",
+            imap_port=extra.get("gmail_imap_port") or 993,
+            folders=extra.get("gmail_imap_folders") or "INBOX,Spam,[Gmail]/Spam",
+            local_len=extra.get("gmail_forward_local_len") or 10,
+            proxy=proxy,
+        )
     else:  # laoudo
         return LaoudoMailbox(
             auth_token=extra.get("laoudo_auth", ""),
             email=extra.get("laoudo_email", ""),
             account_id=extra.get("laoudo_account_id", ""),
+        )
+
+
+class GmailForwardMailbox(BaseMailbox):
+    """自有域名转发到 Gmail：随机 local@domain，IMAP 从 Gmail 收 Grok 验证码。
+
+    前提：
+      1) 域名 MX 已指向转发（如 Spaceship efwd）
+      2) 开启 catch-all / 通配转发到 Gmail（任意 xxx@domain 都能进邮箱）
+      3) Gmail 开启 IMAP + 应用专用密码（两步验证后生成）
+    """
+
+    def __init__(
+        self,
+        domain: str = "",
+        imap_user: str = "",
+        imap_password: str = "",
+        imap_host: str = "imap.gmail.com",
+        imap_port: int | str = 993,
+        folders: str = "INBOX,Spam,[Gmail]/Spam",
+        local_len: int | str = 10,
+        proxy: str = None,
+    ):
+        self.domain = str(domain or "").strip().lstrip("@").lower()
+        self.imap_user = str(imap_user or "").strip()
+        self.imap_password = str(imap_password or "").strip().replace(" ", "")
+        self.imap_host = str(imap_host or "imap.gmail.com").strip() or "imap.gmail.com"
+        try:
+            self.imap_port = int(imap_port or 993)
+        except (TypeError, ValueError):
+            self.imap_port = 993
+        try:
+            self.local_len = max(6, min(20, int(local_len or 10)))
+        except (TypeError, ValueError):
+            self.local_len = 10
+        raw_folders = str(folders or "INBOX,Spam,[Gmail]/Spam")
+        self.folders = [
+            x.strip() for x in raw_folders.replace(";", ",").split(",") if x.strip()
+        ] or ["INBOX"]
+        # Gmail IMAP 走代理经常抽风，默认直连；proxy 参数保留兼容
+        self.proxy = proxy
+        self._last_email = ""
+
+    def _require_cfg(self) -> None:
+        if not self.domain or "@" in self.domain or "." not in self.domain:
+            raise RuntimeError("gmail_forward 需要配置 gmail_forward_domain（如 your-domain.com）")
+        if not self.imap_user or "@" not in self.imap_user:
+            raise RuntimeError("gmail_forward 需要配置 gmail_imap_user（Gmail 地址）")
+        if not self.imap_password:
+            raise RuntimeError(
+                "gmail_forward 需要 gmail_imap_password（Gmail 应用专用密码，不是登录密码）"
+            )
+
+    def _open_imap(self):
+        import imaplib
+        import ssl
+
+        self._require_cfg()
+        ctx = ssl.create_default_context()
+        conn = imaplib.IMAP4_SSL(self.imap_host, self.imap_port, ssl_context=ctx)
+        conn.login(self.imap_user, self.imap_password)
+        return conn
+
+    def get_email(self) -> MailboxAccount:
+        import random
+        import string
+
+        self._require_cfg()
+        local = "".join(
+            random.choices(string.ascii_lowercase + string.digits, k=self.local_len)
+        )
+        email = f"{local}@{self.domain}"
+        self._last_email = email
+        self._log(f"[gmail_forward] 生成别名: {email} → IMAP {self.imap_user}")
+        return MailboxAccount(
+            email=email,
+            account_id=email,
+            extra={
+                "domain": self.domain,
+                "imap_user": self.imap_user,
+                "local": local,
+            },
+        )
+
+    def get_current_ids(self, account: MailboxAccount) -> set:
+        ids: set = set()
+        conn = None
+        try:
+            conn = self._open_imap()
+            for folder in self.folders:
+                try:
+                    typ, _ = conn.select(f'"{folder}"' if " " in folder or "[" in folder else folder, readonly=True)
+                    if typ != "OK":
+                        # Gmail 标签路径有时要原样
+                        typ, _ = conn.select(folder, readonly=True)
+                    if typ != "OK":
+                        continue
+                    typ, data = conn.uid("search", None, "ALL")
+                    if typ != "OK" or not data or not data[0]:
+                        continue
+                    uids = data[0].split()
+                    # 只记最近 80 封，避免全量
+                    for uid in uids[-80:]:
+                        ids.add(f"{folder}:{uid.decode() if isinstance(uid, bytes) else uid}")
+                except Exception:
+                    continue
+        except Exception as exc:
+            self._log(f"[gmail_forward] 快照收件箱失败（可忽略）: {exc}")
+        finally:
+            if conn is not None:
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
+        return ids
+
+    @staticmethod
+    def _msg_targets_account(raw: bytes | str, account_email: str) -> bool:
+        text = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
+        target = (account_email or "").strip().lower()
+        if not target:
+            return False
+        local = target.split("@", 1)[0]
+        lower = text.lower()
+        # 转发后 To 常被改成 Gmail，靠原始收件人相关头 / 正文痕迹匹配
+        if target in lower:
+            return True
+        markers = (
+            f"to: {target}",
+            f"delivered-to: {target}",
+            f"x-original-to: {target}",
+            f"x-forwarded-to: {target}",
+            f"envelope-to: {target}",
+            f"for <{target}>",
+            f"for {target}",
+            f"recipient: {target}",
+        )
+        if any(m in lower for m in markers):
+            return True
+        # 宽松：local-part@domain 片段
+        if local and len(local) >= 6 and f"{local}@" in lower:
+            return True
+        return False
+
+    def wait_for_code(
+        self,
+        account: MailboxAccount,
+        keyword: str = "",
+        timeout: int = 120,
+        before_ids: set = None,
+        code_pattern: str = None,
+        **kwargs,
+    ) -> str:
+        import email as email_lib
+        import email.header
+        import email.utils
+        import re
+        from datetime import datetime, timezone
+
+        self._require_cfg()
+        seen = set(before_ids or set())
+        account_email = str(getattr(account, "email", "") or self._last_email or "").strip().lower()
+        exclude_codes = {
+            str(c).strip()
+            for c in (kwargs.get("exclude_codes") or set())
+            if str(c or "").strip()
+        }
+        otp_sent_at = kwargs.get("otp_sent_at")
+        try:
+            otp_ts = float(otp_sent_at) if otp_sent_at not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            otp_ts = 0.0
+        if otp_ts > 10_000_000_000:
+            otp_ts = otp_ts / 1000.0
+
+        pattern = code_pattern or r"[A-Z0-9]{3}-[A-Z0-9]{3}"
+
+        def _decode_header(val: str) -> str:
+            parts = email_lib.header.decode_header(val or "")
+            out = []
+            for chunk, enc in parts:
+                if isinstance(chunk, bytes):
+                    out.append(chunk.decode(enc or "utf-8", errors="ignore"))
+                else:
+                    out.append(str(chunk or ""))
+            return "".join(out)
+
+        def _body_text(msg) -> str:
+            chunks: list[str] = []
+            if msg.is_multipart():
+                for part in msg.walk():
+                    ctype = (part.get_content_type() or "").lower()
+                    if ctype not in ("text/plain", "text/html"):
+                        continue
+                    try:
+                        payload = part.get_payload(decode=True) or b""
+                        charset = part.get_content_charset() or "utf-8"
+                        chunks.append(payload.decode(charset, errors="ignore"))
+                    except Exception:
+                        continue
+            else:
+                try:
+                    payload = msg.get_payload(decode=True) or b""
+                    charset = msg.get_content_charset() or "utf-8"
+                    chunks.append(payload.decode(charset, errors="ignore"))
+                except Exception:
+                    chunks.append(str(msg.get_payload() or ""))
+            return "\n".join(chunks)
+
+        def _extract(subject: str, body: str) -> Optional[str]:
+            blob = f"{subject}\n{body}"
+            # 优先 Grok ABC-DEF
+            for rx in (
+                pattern,
+                r"[A-Z0-9]{3}-[A-Z0-9]{3}",
+                r"(?is)(?:verification|code|验证码)[^\n]{0,40}([A-Z0-9]{3}-[A-Z0-9]{3})",
+            ):
+                try:
+                    m = re.search(rx, blob, re.I)
+                except re.error:
+                    continue
+                if not m:
+                    continue
+                code = (m.group(1) if m.groups() else m.group(0) or "").strip().upper()
+                if code and code not in exclude_codes:
+                    return code
+            code = self._safe_extract(blob, pattern)
+            if code and str(code).strip() not in exclude_codes:
+                return str(code).strip()
+            return None
+
+        def poll_once() -> Optional[str]:
+            conn = None
+            try:
+                conn = self._open_imap()
+                for folder in self.folders:
+                    try:
+                        select_name = folder
+                        typ, _ = conn.select(select_name, readonly=True)
+                        if typ != "OK" and (" " in folder or "[" in folder):
+                            typ, _ = conn.select(f'"{folder}"', readonly=True)
+                        if typ != "OK":
+                            continue
+                        # 最近 UID，倒序扫
+                        typ, data = conn.uid("search", None, "ALL")
+                        if typ != "OK" or not data or not data[0]:
+                            continue
+                        uids = data[0].split()
+                        for uid in reversed(uids[-40:]):
+                            uid_s = uid.decode() if isinstance(uid, bytes) else str(uid)
+                            mid = f"{folder}:{uid_s}"
+                            if mid in seen:
+                                continue
+                            typ, msg_data = conn.uid("fetch", uid, "(RFC822)")
+                            if typ != "OK" or not msg_data:
+                                continue
+                            raw = b""
+                            for item in msg_data:
+                                if isinstance(item, tuple) and len(item) >= 2 and item[1]:
+                                    raw = item[1]
+                                    break
+                            if not raw:
+                                continue
+                            seen.add(mid)
+                            if not self._msg_targets_account(raw, account_email):
+                                # 转发场景：若整箱很干净也可放宽——仅当发件像 xAI 且近期
+                                # 这里仍要求命中别名，避免串号
+                                continue
+                            msg = email_lib.message_from_bytes(raw)
+                            subject = _decode_header(msg.get("Subject", ""))
+                            if otp_ts:
+                                try:
+                                    parsed = email.utils.parsedate_to_datetime(msg.get("Date", ""))
+                                    if parsed is not None:
+                                        if parsed.tzinfo is None:
+                                            parsed = parsed.replace(tzinfo=timezone.utc)
+                                        if parsed.timestamp() + 120 < otp_ts:
+                                            continue
+                                except Exception:
+                                    pass
+                            body = _body_text(msg)
+                            text = f"{subject}\n{body}"
+                            if keyword and keyword.lower() not in text.lower():
+                                # xAI 邮件不一定带 keyword，仅在显式传入时过滤
+                                if keyword.lower() not in ("xai", "grok", "x.ai"):
+                                    continue
+                            code = _extract(subject, body)
+                            if code:
+                                self._log(f"[gmail_forward] 命中验证码 {code} · {account_email} · {folder}")
+                                return code
+                    except Exception as exc:
+                        self._log(f"[gmail_forward] 扫文件夹 {folder} 失败: {exc}")
+                        continue
+            except Exception as exc:
+                self._log(f"[gmail_forward] IMAP 轮询失败: {exc}")
+            finally:
+                if conn is not None:
+                    try:
+                        conn.logout()
+                    except Exception:
+                        pass
+            return None
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=4.0,
+            poll_once=poll_once,
+            timeout_message=f"Gmail 转发收码超时 ({timeout}s) · {account_email}",
         )
 
 
@@ -3085,6 +3419,456 @@ class LuckMailMailbox(BaseMailbox):
                 f"has_new_mail={saw_new_mail}"
             ),
         )
+
+
+class MailNestMailbox(BaseMailbox):
+    """MailNest (mailnest.top) 临时/专属邮箱接码。
+
+    文档: https://mailnest.top/api/docs  OpenAPI: /api/openapi.json
+    临时邮箱: POST /api/v1/email/temporary/buy  {"project_code","count"}
+    收信:     POST /api/v1/email/receive        {"email"}
+    释放:     POST /api/v1/email/release        {"email"}
+    鉴权: Authorization: Bearer <api_key>
+    """
+
+    def __init__(
+        self,
+        base_url: str = "https://mailnest.top",
+        api_key: str = "",
+        project_code: str = "x-ai001",
+        sale_mode: str = "temporary",
+        proxy: str = None,
+    ):
+        base = str(base_url or "https://mailnest.top").strip().rstrip("/")
+        if not base:
+            base = "https://mailnest.top"
+        key = str(api_key or "").strip()
+        if not key:
+            raise RuntimeError(
+                "MailNest 未配置 API Key：请在邮箱服务填写 mailnest_api_key"
+            )
+        self._base_url = base
+        self._api_key = key
+        self._project_code = str(project_code or "x-ai001").strip() or "x-ai001"
+        mode = str(sale_mode or "temporary").strip().lower()
+        if mode not in {"temporary", "exclusive"}:
+            mode = "temporary"
+        self._sale_mode = mode
+        self._proxy = proxy
+        self._email = ""
+        self._order_id = ""
+
+    def _proxies(self):
+        return build_requests_proxy_config(self._proxy)
+
+    def _headers(self) -> dict:
+        return {
+            "Authorization": f"Bearer {self._api_key}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+    def _request(self, method: str, path: str, payload: dict = None, timeout: int = 30) -> dict:
+        import requests
+
+        url = f"{self._base_url}{path}"
+        try:
+            resp = requests.request(
+                method=method.upper(),
+                url=url,
+                headers=self._headers(),
+                json=payload if payload is not None else None,
+                proxies=self._proxies(),
+                timeout=timeout,
+            )
+        except Exception as e:
+            raise RuntimeError(f"MailNest 请求失败 {method.upper()} {path}: {e}") from e
+
+        text = (resp.text or "").strip()
+        try:
+            data = resp.json() if text else {}
+        except Exception:
+            data = {"raw": text[:500]}
+
+        if resp.status_code >= 400:
+            msg = ""
+            if isinstance(data, dict):
+                msg = str(data.get("msg") or data.get("message") or data.get("error") or "")
+            raise RuntimeError(
+                f"MailNest HTTP {resp.status_code} {method.upper()} {path}: {msg or text[:300]}"
+            )
+
+        if isinstance(data, dict):
+            code = str(data.get("code") or "").strip()
+            # success code is "00000"
+            if code and code not in {"00000", "0", "200", "success", "ok"}:
+                msg = str(data.get("msg") or data.get("message") or code)
+                raise RuntimeError(f"MailNest 业务错误 {code}: {msg}")
+            return data
+        return {"data": data}
+
+    def _page_items(self, path: str, page_size: int = 20, max_pages: int = 5) -> list:
+        """Paginate list endpoints that return {data:{items,total,page,...}}."""
+        items: list = []
+        for page in range(1, max(int(max_pages), 1) + 1):
+            data = self._request(
+                "GET",
+                f"{path}?page={page}&page_size={int(page_size)}",
+                timeout=30,
+            )
+            payload = data.get("data") if isinstance(data, dict) else None
+            page_items = []
+            total = 0
+            if isinstance(payload, dict):
+                raw = payload.get("items") or []
+                if isinstance(raw, list):
+                    page_items = [x for x in raw if isinstance(x, dict)]
+                try:
+                    total = int(payload.get("total") or 0)
+                except Exception:
+                    total = 0
+            elif isinstance(payload, list):
+                page_items = [x for x in payload if isinstance(x, dict)]
+                total = len(page_items)
+
+            items.extend(page_items)
+            if not page_items:
+                break
+            if total and len(items) >= total:
+                break
+            if len(page_items) < int(page_size):
+                break
+        return items
+
+    @staticmethod
+    def _is_holding_status(status: str) -> bool:
+        s = str(status or "").strip().lower()
+        if not s:
+            # Some list endpoints omit status for currently-held rows.
+            return True
+        dead = {
+            "expired",
+            "released",
+            "closed",
+            "done",
+            "finished",
+            "cancelled",
+            "canceled",
+            "fail",
+            "failed",
+            "timeout",
+            "已释放",
+            "已过期",
+            "超时",
+            "结束",
+        }
+        if s in dead:
+            return False
+        # Chinese UI: 持有中 / 使用中 / 生效中
+        if any(x in s for x in ("持有", "使用中", "生效", "进行")):
+            return True
+        # English-ish holding states (MailNest exclusive uses "having")
+        if s in {
+            "holding",
+            "hold",
+            "having",
+            "have",
+            "active",
+            "using",
+            "running",
+            "pending",
+            "open",
+            "alive",
+        }:
+            return True
+        # billing_status free/charged is not mailbox liveness
+        return s not in {"free", "charged"}
+
+    def _reuse_held_mailbox(self) -> Optional[MailboxAccount]:
+        """Prefer an already-purchased, still-held mailbox for this project.
+
+        Official product stock can show 0 while the account already holds a
+        temporary mailbox that is still within its window. Reuse that first.
+        """
+        list_path = (
+            "/api/v1/email/exclusive"
+            if self._sale_mode == "exclusive"
+            else "/api/v1/email/temporary"
+        )
+        try:
+            held = self._page_items(list_path, page_size=20, max_pages=3)
+        except Exception as e:
+            self._log(f"[MailNest] 查询已持有邮箱失败: {e}")
+            return None
+
+        project = self._project_code.lower()
+        candidates = []
+        for item in held:
+            email = str(item.get("email") or "").strip()
+            if not email:
+                continue
+            item_project = str(item.get("project_code") or "").strip()
+            # exclusive rows may not carry project_code
+            if self._sale_mode == "temporary" and project:
+                if item_project and item_project.lower() != project:
+                    continue
+            status = str(item.get("status") or "").strip()
+            if not self._is_holding_status(status):
+                continue
+            candidates.append(item)
+
+        if not candidates:
+            self._log(
+                f"[MailNest] 当前无持有中的{self._sale_mode}邮箱"
+                f"（project={self._project_code or '-'}），将尝试新购"
+            )
+            return None
+
+        # Prefer newest by started_at / expired_at when present.
+        def sort_key(it: dict):
+            return (
+                str(it.get("started_at") or ""),
+                str(it.get("expired_at") or ""),
+                str(it.get("id") or ""),
+            )
+
+        candidates.sort(key=sort_key, reverse=True)
+        item = candidates[0]
+        email = str(item.get("email") or "").strip()
+        order_id = str(item.get("id") or "").strip()
+        self._email = email
+        self._order_id = order_id
+        self._log(
+            f"[MailNest] 复用已持有邮箱: {email}"
+            f" status={item.get('status') or '持有中'}"
+            f" expired_at={item.get('expired_at') or '-'}"
+        )
+        return MailboxAccount(
+            email=email,
+            account_id=order_id or email,
+            extra={
+                "provider": "mailnest",
+                "order_id": order_id,
+                "project_code": item.get("project_code") or self._project_code,
+                "sale_mode": item.get("sale_mode") or self._sale_mode,
+                "price": item.get("price"),
+                "expired_at": item.get("expired_at"),
+                "reused": True,
+            },
+        )
+
+    def _account_from_buy_item(self, item: dict, *, reused: bool = False) -> MailboxAccount:
+        email = str(item.get("email") or "").strip()
+        order_id = str(item.get("id") or "").strip()
+        if not email:
+            raise RuntimeError(f"MailNest 返回缺少 email: {item}")
+        self._email = email
+        self._order_id = order_id
+        stock_hint = ""
+        if item.get("expired_at"):
+            stock_hint = f" expired_at={item.get('expired_at')}"
+        prefix = "复用" if reused else "新购"
+        self._log(f"[MailNest] {prefix}邮箱: {email}{stock_hint}")
+        if item.get("price") is not None and not reused:
+            self._log(
+                f"[MailNest] 价格: {item.get('price')} status={item.get('status') or '-'}"
+            )
+        return MailboxAccount(
+            email=email,
+            account_id=order_id or email,
+            extra={
+                "provider": "mailnest",
+                "order_id": order_id,
+                "project_code": item.get("project_code") or self._project_code,
+                "sale_mode": item.get("sale_mode") or self._sale_mode,
+                "price": item.get("price"),
+                "expired_at": item.get("expired_at"),
+                "reused": reused,
+            },
+        )
+
+    def get_email(self) -> MailboxAccount:
+        if not self._project_code and self._sale_mode == "temporary":
+            raise RuntimeError("MailNest 未设置 project_code，无法购买临时邮箱")
+
+        # 1) Reuse still-held mailbox first (stock display can be 0 while holding).
+        reused = self._reuse_held_mailbox()
+        if reused is not None:
+            return reused
+
+        # 2) Buy a new one. Do NOT pre-check product stock — platform stock is
+        #    advisory and often lags; buy API is the source of truth.
+        if self._sale_mode == "exclusive":
+            path = "/api/v1/email/exclusive/buy"
+            body = {"count": 1}
+            self._log("[MailNest] 购买专属邮箱 count=1")
+        else:
+            path = "/api/v1/email/temporary/buy"
+            body = {"project_code": self._project_code, "count": 1}
+            self._log(
+                f"[MailNest] 购买临时邮箱 project_code={self._project_code} count=1"
+            )
+
+        try:
+            data = self._request("POST", path, body, timeout=45)
+        except RuntimeError as e:
+            msg = str(e)
+            # Clearer guidance when platform rejects for empty stock.
+            if any(x in msg for x in ("库存", "stock", "售罄", "不足", "empty")):
+                raise RuntimeError(
+                    f"{msg}；且账号下无可用的持有中邮箱。"
+                    f"请到 MailNest 网页确认 x-ai001 是否有货，或先手动买一封临时邮再跑注册机。"
+                ) from e
+            raise
+
+        items = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(items, list) or not items:
+            raise RuntimeError(f"MailNest 购买返回为空: {data}")
+
+        item = items[0] if isinstance(items[0], dict) else {}
+        return self._account_from_buy_item(item, reused=False)
+
+    def _list_mails(self, email: str) -> list:
+        data = self._request(
+            "POST",
+            "/api/v1/email/receive",
+            {"email": email},
+            timeout=30,
+        )
+        items = data.get("data") if isinstance(data, dict) else None
+        if items is None:
+            return []
+        if isinstance(items, list):
+            return [x for x in items if isinstance(x, dict)]
+        return []
+
+    def get_current_ids(self, account: MailboxAccount) -> set:
+        email = str((account.email if account else "") or self._email or "").strip()
+        if not email:
+            return set()
+        try:
+            mails = self._list_mails(email)
+        except Exception as e:
+            self._log(f"[MailNest] 获取当前邮件 ID 失败: {e}")
+            return set()
+        ids = set()
+        for mail in mails:
+            mid = str(mail.get("id") or "").strip()
+            if mid:
+                ids.add(mid)
+        return ids
+
+    def wait_for_code(
+        self,
+        account: MailboxAccount,
+        keyword: str = "",
+        timeout: int = 120,
+        before_ids: set = None,
+        code_pattern: str = None,
+        **kwargs,
+    ) -> str:
+        email = str((account.email if account else "") or self._email or "").strip()
+        if not email:
+            raise RuntimeError("MailNest 未绑定邮箱，无法等待验证码")
+
+        exclude_codes = {
+            str(code) for code in (kwargs.get("exclude_codes") or set()) if code
+        }
+        seen_message_ids = {str(mid) for mid in (before_ids or set()) if mid}
+        if before_ids is None:
+            seen_message_ids = self.get_current_ids(account)
+            if seen_message_ids:
+                self._log(
+                    f"[MailNest] 已建立旧邮件基线，先跳过 {len(seen_message_ids)} 封历史邮件"
+                )
+
+        keyword_l = str(keyword or "").strip().lower()
+        saw_new_mail = False
+
+        def poll_once() -> Optional[str]:
+            nonlocal saw_new_mail
+            try:
+                mails = self._list_mails(email)
+            except Exception as e:
+                self._log(f"[MailNest] 收信失败: {e}")
+                return None
+
+            found_new = False
+            for mail in mails:
+                mid = str(mail.get("id") or "").strip()
+                if mid and mid in seen_message_ids:
+                    continue
+                found_new = True
+                saw_new_mail = True
+                if mid:
+                    seen_message_ids.add(mid)
+
+                # Prefer platform-extracted code when present.
+                direct = str(mail.get("code_match") or "").strip()
+                if direct and direct not in exclude_codes:
+                    if not keyword_l or keyword_l in (
+                        " ".join(
+                            [
+                                str(mail.get("subject") or ""),
+                                str(mail.get("from_email") or ""),
+                                str(mail.get("body_preview") or ""),
+                                str(mail.get("body") or ""),
+                            ]
+                        ).lower()
+                    ):
+                        self._log(f"[MailNest] 收到验证码(code_match): {direct}")
+                        return direct
+
+                body = " ".join(
+                    [
+                        str(mail.get("subject") or ""),
+                        str(mail.get("from_name") or ""),
+                        str(mail.get("from_email") or ""),
+                        str(mail.get("body_preview") or ""),
+                        str(mail.get("body") or ""),
+                        str(mail.get("code_match") or ""),
+                    ]
+                )
+                if keyword_l and keyword_l not in body.lower():
+                    continue
+                code = self._safe_extract(body, code_pattern)
+                if code and code in exclude_codes:
+                    self._log(
+                        f"[MailNest] 跳过已使用验证码 id={mid or '-'} code={code}"
+                    )
+                    continue
+                if code:
+                    self._log(f"[MailNest] 收到验证码: {code}")
+                    return code
+
+            self._log(
+                f"[MailNest] 轮询中... 新邮件: {'是' if found_new else '否'}"
+            )
+            return None
+
+        try:
+            return self._run_polling_wait(
+                timeout=timeout,
+                poll_interval=3,
+                poll_once=poll_once,
+                timeout_message=(
+                    f"MailNest 等待验证码超时 ({timeout}s)，"
+                    f"email={email} has_new_mail={saw_new_mail}"
+                ),
+            )
+        except Exception:
+            # Best-effort release so temporary stock isn't stuck on failure.
+            try:
+                self._request(
+                    "POST",
+                    "/api/v1/email/release",
+                    {"email": email},
+                    timeout=15,
+                )
+                self._log(f"[MailNest] 超时后已释放邮箱: {email}")
+            except Exception:
+                pass
+            raise
 
 
 class OutlookMailboxBackend(ABC):

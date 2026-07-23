@@ -1223,6 +1223,19 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 			s.rateLimitGrok(ctx, account, resetAt)
 		}
 		// updateGrokUsageSnapshot installs both runtime and durable rate-limit state.
+	case http.StatusPaymentRequired:
+		// 402 = spending-limit / no credits. Permanent — auto-disable the account
+		// so it never gets scheduled again. The snapshot was already persisted above.
+		slog.Warn("grok_account_payment_required_disabling",
+			"account_id", account.ID,
+			"account_name", account.Name,
+		)
+		if s.accountRepo != nil {
+			_ = s.accountRepo.SetSchedulable(ctx, account.ID, false)
+			// Also block scheduling in-memory so the runtime doesn't re-pick it
+			// before the next snapshot refresh.
+			s.BlockAccountScheduling(account, time.Now().Add(365*24*time.Hour), "402")
+		}
 	default:
 		if statusCode >= 500 {
 			s.tempUnscheduleGrok(ctx, account, 2*time.Minute, "grok upstream temporary error")

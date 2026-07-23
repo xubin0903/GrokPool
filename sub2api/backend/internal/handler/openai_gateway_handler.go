@@ -2170,6 +2170,12 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
 	upstreamMsg := service.ExtractUpstreamErrorMessage(responseBody)
 	service.SetOpsUpstreamError(c, statusCode, upstreamMsg, "")
 
+	// Prompt/context oversize: keep the real upstream text so clients can compact manually.
+	if service.IsOpenAIContextWindowError(upstreamMsg, responseBody) && strings.TrimSpace(upstreamMsg) != "" {
+		h.handleStreamingAwareError(c, http.StatusBadRequest, "invalid_request_error", upstreamMsg, streamStarted)
+		return
+	}
+
 	// 使用默认的错误映射
 	status, errType, errMsg := h.mapUpstreamError(statusCode)
 	h.handleStreamingAwareError(c, status, errType, errMsg, streamStarted)

@@ -164,6 +164,14 @@ func isOpenAITransientProcessingError(upstreamStatusCode int, upstreamMsg string
 	return match(string(upstreamBody))
 }
 
+// IsOpenAIContextWindowError reports whether the upstream error is a prompt/context
+// oversize rejection that the client must fix (compact / new session), not an
+// account/upstream outage. Includes OpenAI-style context_window messages and
+// xAI/Grok "maximum prompt length" rejections.
+func IsOpenAIContextWindowError(upstreamMsg string, upstreamBody []byte) bool {
+	return isOpenAIContextWindowError(upstreamMsg, upstreamBody)
+}
+
 func isOpenAIContextWindowError(upstreamMsg string, upstreamBody []byte) bool {
 	match := func(text string) bool {
 		lower := strings.ToLower(strings.TrimSpace(text))
@@ -174,6 +182,14 @@ func isOpenAIContextWindowError(upstreamMsg string, upstreamBody []byte) bool {
 			return true
 		}
 		if strings.Contains(lower, "maximum context length") || strings.Contains(lower, "max context length") {
+			return true
+		}
+		// xAI/Grok: "This model's maximum prompt length is 500000 but the request contains 548167 tokens."
+		if strings.Contains(lower, "maximum prompt length") || strings.Contains(lower, "max prompt length") {
+			return true
+		}
+		if strings.Contains(lower, "prompt length") &&
+			(strings.Contains(lower, "token") || strings.Contains(lower, "exceed") || strings.Contains(lower, "too large") || strings.Contains(lower, "too long")) {
 			return true
 		}
 		hasExceeded := strings.Contains(lower, "exceed") || strings.Contains(lower, "too large") || strings.Contains(lower, "too long")
@@ -198,6 +214,8 @@ func isOpenAIContextWindowError(upstreamMsg string, upstreamBody []byte) bool {
 		"error.message",
 		"response.error.message",
 		"message",
+		// xAI/Grok: {"code":"...","error":"maximum prompt length..."}
+		"error",
 		"error.code",
 		"response.error.code",
 		"code",
@@ -501,7 +519,11 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 		errType = "upstream_error"
 		errMsg = "Upstream request failed"
 	}
+	// Prompt/context oversize is a client-side problem (manual compact / new session).
+	// Surface the upstream text as 400 instead of a generic 502 so the user can act on it.
 	if isOpenAIContextWindowError(upstreamMsg, body) && upstreamMsg != "" {
+		statusCode = http.StatusBadRequest
+		errType = "invalid_request_error"
 		errMsg = upstreamMsg
 	}
 

@@ -63,7 +63,7 @@
 
 - **🌐 代理**：复用本机 Clash，自动探测端口（Clash Verge 默认 `7897`）
 - **🤖 注册引擎**：Chromium 有头 / Camoufox 无头反检测，面板下拉切换
-- **📧 邮箱**：面板下拉多邮箱源（CF Worker / MoeMail / TempMail.lol / DuckMail / GPTMail / LuckMail / MaliAPI 等）；公共 Tempmailer 已移除
+- **📧 邮箱**：面板下拉多邮箱源（CF Worker / MoeMail / TempMail.lol / DuckMail / GPTMail / LuckMail / MailNest / MaliAPI 等）；公共 Tempmailer 已移除
 - **🔄 SSO → CPA**：注册成功后自动把 web SSO 换成 CLIProxyAPI 可用的 OAuth JSON
 - **🔞 NSFW 自动开启**：注册成功后自动设置 ToS、生日、NSFW 偏好
 - **📦 产物下载**（同一批账号，三种格式，不重复注册/换票）：
@@ -127,7 +127,7 @@
 | `proxy` | Clash 代理地址；端口不通时启动会自动探测并写回 |
 | `allow_proxy_fallback` | 代理失败是否回退直连，默认 `false` |
 | `browser_engine` | `chromium`（有头，默认）或 `camoufox`（无头反检测） |
-| `email_provider` | 邮箱源 id（如 `cfworker` / `moemail` / `tempmail_lol` / `luckmail`） |
+| `email_provider` | 邮箱源 id（如 `cfworker` / `moemail` / `tempmail_lol` / `luckmail` / `mailnest`） |
 | `cfworker_api_url` | CF Worker / 自建 API 根地址（选 cfworker 时） |
 | `cfworker_admin_token` | 管理 Token |
 | `cfworker_domain` | 邮箱域名 |
@@ -135,7 +135,7 @@
 | `register_count` | 单次任务注册数量 |
 | `round_timeout_sec` | 单账号整轮硬超时（秒），默认 `300`；超时杀进程并进入下一轮 |
 
-完整字段见 `config.example.json`（含 MoeMail / DuckMail / LuckMail / GPTMail 等）。
+完整字段见 `config.example.json`（含 MoeMail / DuckMail / LuckMail / MailNest / GPTMail 等）。
 
 ### 📧 邮箱（重要）
 
@@ -155,6 +155,7 @@
 | `gptmail` | GPTMail | 第三方 API |
 | `maliapi` | YYDS / MaliAPI | 接码/邮箱 API |
 | `luckmail` | LuckMail | 接码/买邮平台 |
+| `mailnest` | MailNest | [mailnest.top](https://mailnest.top/buy-email) 临时邮/专属邮，Grok 项目代号 `x-ai001` |
 | `skymail` / `cloudmail` | SkyMail / CloudMail | API + Token/账号 |
 | `freemail` | Freemail | 自建 |
 | `opentrashmail` | OpenTrashMail | 自建/开源 |
@@ -245,7 +246,7 @@ grok-register-win/
 
 - 请使用 **v1.2.0+**，并强制刷新面板（Ctrl+F5）
 - 旧版若残留重复 `saveEmailConfig` 会把所有源保存成 custom 导致失败
-- 选 CF Worker / LuckMail 等需填写对应 API/Key；TempMail.lol / MoeMail 可先空 Key 保存
+- 选 CF Worker / LuckMail / MailNest 等需填写对应 API/Key；TempMail.lol / MoeMail 可先空 Key 保存
 </details>
 
 <details>

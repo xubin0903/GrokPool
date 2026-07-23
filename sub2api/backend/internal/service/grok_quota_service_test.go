@@ -1019,3 +1019,25 @@ func TestShouldAutoPauseGrokAccountByQuota(t *testing.T) {
 		})
 	}
 }
+
+
+func TestClassifyGrokAccountLiveness_Billing200WithChat402BodyIsDead(t *testing.T) {
+	t.Parallel()
+	probeErr := `error: code=502 reason="GROK_QUOTA_PROBE_UPSTREAM_ERROR" message="upstream returned 402 for probe model \"grok-4.5\": {\"code\":\"personal-team-blocked:spending-limit\",\"error\":\"You have run out of credits or need a Grok subscription.\"}" metadata=map[]`
+	live := ClassifyGrokAccountLiveness(1359, &GrokQuotaProbeResult{
+		Source:     "billing_probe",
+		StatusCode: http.StatusOK,
+		ProbeError: probeErr,
+	}, nil)
+	require.True(t, live.Dead)
+	require.False(t, live.Alive)
+	require.False(t, live.Unknown)
+	require.Equal(t, "payment_required_no_credits", live.Reason)
+	require.Equal(t, http.StatusPaymentRequired, live.StatusCode)
+}
+
+func TestExtractEmbeddedUpstreamStatus(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, 402, extractEmbeddedUpstreamStatus(`upstream returned 402 for probe model "grok-4.5"`))
+	require.Equal(t, 0, extractEmbeddedUpstreamStatus("no status here"))
+}
